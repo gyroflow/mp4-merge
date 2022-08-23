@@ -27,7 +27,7 @@ fn main() {
         println!("Merging file {:?}", p);
         files.push(p.to_owned());
         if output_file.is_none() {
-            output_file = Some(p.with_file_name(format!("{}_joined.mp4", p.to_str().unwrap())));
+            output_file = Some(p.with_file_name(format!("{}_joined.mp4", p.file_name().unwrap().to_str().unwrap())));
         }
     }
     if files.is_empty() { eprintln!("No input files!"); return; }

@@ -3,6 +3,7 @@
 
 use std::io::{ Read, Seek, Result };
 use std::path::{ Path, PathBuf };
+use byteorder::{ ReadBytesExt, BigEndian };
 use std::time::Instant;
 
 mod desc_reader;
@@ -36,15 +37,10 @@ fn typ_to_str(typ: u32) -> String {
 
 pub fn read_box<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64, u64, i64)> {
     let pos = reader.stream_position()?;
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-
-    let size = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-    let typ = u32::from_be_bytes(buf[4..8].try_into().unwrap());
-
+    let size = reader.read_u32::<BigEndian>()?;
+    let typ = reader.read_u32::<BigEndian>()?;
     if size == 1 {
-        reader.read_exact(&mut buf)?;
-        let largesize = u64::from_be_bytes(buf);
+        let largesize = reader.read_u64::<BigEndian>()?;
         Ok((typ, pos, largesize - 8, 16))
     } else {
         Ok((typ, pos, size as u64, 8))
@@ -66,7 +62,7 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
             mdat.0 = Some(PathBuf::from(path));
             desc.mdat_offset += mdat.2;
             for t in &mut desc.moov_tracks {
-                t.stss_offset += t.stsz.len() as u32;
+                t.stss_offset = t.stsz_count;
             }
         }
 
@@ -83,7 +79,7 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
             debounce = Instant::now();
         }
     });
-    writer::rewrite_from_desc(&mut f1, &mut f_out, &desc, 0, u64::MAX).unwrap();
+    writer::rewrite_from_desc(&mut f1, &mut f_out, &mut desc, 0, u64::MAX).unwrap();
     progress_cb(1.0);
 
     Ok(())

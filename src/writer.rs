@@ -5,7 +5,7 @@ use std::io::{ Read, Write, Seek, Result, SeekFrom };
 use byteorder::{ ReadBytesExt, WriteBytesExt, BigEndian };
 use crate::{ fourcc, read_box, typ_to_str, desc_reader::Desc };
 
-pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file: &mut W, desc: &Desc, track: usize, max_read: u64) -> Result<u64> {
+pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file: &mut W, desc: &mut Desc, track: usize, max_read: u64) -> Result<u64> {
     let mut total_read_size = 0;
     let mut total_new_size = 0;
     let mut tl_track = track;
@@ -36,6 +36,8 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
             let pos = output_file.stream_position()?;
             output_file.write(&0u64.to_be_bytes())?;
             new_size = 16;
+
+            desc.mdat_final_position = output_file.stream_position()?;
 
             // Merge all mdats
             for (fpath, mo, ms) in &desc.mdat_position {
@@ -80,7 +82,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
                 }
             }
 
-        } else if typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") {
+        } else if typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") {
             log::debug!("Writing new {}, offset: {}, size: {size}", typ_to_str(typ), offs);
 
             d.seek(SeekFrom::Current(size as i64 - header_size))?;
@@ -94,17 +96,26 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
 
             let track_desc = desc.moov_tracks.get(tl_track).unwrap();
             if typ == fourcc("stts") {
-                output_file.write_u32::<BigEndian>(track_desc.stts.len() as u32)?;
+                let mut new_stts: Vec<(u32, u32)> = Vec::with_capacity(track_desc.stts.len());
+                let mut prev_delta = None;
+                for x in &track_desc.stts {
+                    if let Some(prev_delta) = prev_delta {
+                        if prev_delta == x.1 { (*new_stts.last_mut().unwrap()).0 += x.0; continue; }
+                    }
+                    prev_delta = Some(x.1);
+                    new_stts.push(*x);
+                }
+                output_file.write_u32::<BigEndian>(new_stts.len() as u32)?;
                 new_size += 4;
-                for (count, delta) in &track_desc.stts {
+                for (count, delta) in &new_stts {
                     output_file.write_u32::<BigEndian>(*count)?;
                     output_file.write_u32::<BigEndian>(*delta)?;
                     new_size += 8;
                 }
             }
             if typ == fourcc("stsz") {
-                output_file.write_u32::<BigEndian>(0)?; // sample_size
-                output_file.write_u32::<BigEndian>(track_desc.stsz.len() as u32)?;
+                output_file.write_u32::<BigEndian>(track_desc.stsz_sample_size)?; // sample_size
+                output_file.write_u32::<BigEndian>(track_desc.stsz_count)?;
                 new_size += 8;
                 for x in &track_desc.stsz { output_file.write_u32::<BigEndian>(*x as u32)?; new_size += 4; }
             }
@@ -117,12 +128,14 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
                 output_file.write_u32::<BigEndian>(track_desc.stco.len() as u32)?;
                 new_size += 4;
                 for x in &track_desc.stco {
-                    output_file.write_u64::<BigEndian>(*x + 8)?; // TODO: + 8 only if the original mdat was not large box already
+                    output_file.write_u64::<BigEndian>(*x + desc.mdat_final_position)?;
                     new_size += 8;
                 }
             }
+            if typ == fourcc("sdtp") {
+                for x in &track_desc.sdtp { output_file.write_u8(*x)?; new_size += 1; }
+            }
             patch_bytes(output_file, out_pos, &(new_size as u32).to_be_bytes())?;
-
         } else {
             log::debug!("Writing original {}, offset: {}, size: {size}", typ_to_str(typ), offs);
 

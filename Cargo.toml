@@ -1,11 +1,12 @@
 [package]
 name = "mp4-merge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Adrian <adrian.eddy@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "A tool and library to losslessly join multiple .mp4 files shot with same camera and settings"
 repository = "https://github.com/gyroflow/mp4-merge"
+readme = "README.md"
 
 [dependencies]
 byteorder = "1.4.3"

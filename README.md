@@ -10,7 +10,7 @@ All original tracks are preserved, all metadata is kept as in the original.
 It was created to help stabilizing such files in [Gyroflow](https://github.com/gyroflow/gyroflow).
 
 ## Download:
-See the [Releases](https://github.com/gyroflow/mp4_parse/releases) page.
+See the [Releases](https://github.com/gyroflow/mp4-merge/releases) page.
 
 ## Usage:
 
@@ -28,7 +28,7 @@ mp4_merge IN_FILE1.mp4 IN_FILE2.mp4 IN_FILE3.mp4 ... --out result.mp4
 
 ```toml
 [dependencies]
-mp4_merge = "0.1.0"
+mp4-merge = "0.1.1"
 ```
 ```rust
 let files = ["IN_FILE1.mp4", "IN_FILE2.mp4"];
