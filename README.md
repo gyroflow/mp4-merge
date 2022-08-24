@@ -13,7 +13,9 @@ It was created to help stabilizing such files in [Gyroflow](https://github.com/g
 See the [Releases](https://github.com/gyroflow/mp4-merge/releases) page.
 
 ## Usage:
+The easiest way is to just drag & drop multiple .mp4 files to the `mp4_merge` program.
 
+Usage from command line:
 - Merge specified files and output to `IN_FILE1.mp4_joined.mp4`
 ```shell
 mp4_merge IN_FILE1.mp4 IN_FILE2.mp4 IN_FILE3.mp4 ...

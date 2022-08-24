@@ -71,8 +71,6 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
 
                 if typ == fourcc("elst") {
                     d.seek(SeekFrom::Current(4))?; // Skip fields
-                }
-                if typ == fourcc("elst")  {
                     track_desc.elst_segment_duration += if v == 1 { d.read_u64::<BigEndian>()? } else { d.read_u32::<BigEndian>()? as u64 };
                 }
                 if typ == fourcc("stsz") {
