@@ -41,7 +41,7 @@ pub fn read_box<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64, u64, i64)> 
     let typ = reader.read_u32::<BigEndian>()?;
     if size == 1 {
         let largesize = reader.read_u64::<BigEndian>()?;
-        Ok((typ, pos, largesize - 8, 16))
+        Ok((typ, pos, largesize, 16))
     } else {
         Ok((typ, pos, size as u64, 8))
     }
@@ -66,7 +66,7 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
             }
         }
 
-        progress_cb(((i as f64 + 1.0) / files.len() as f64) * 0.2);
+        progress_cb(((i as f64 + 1.0) / files.len() as f64) * 0.1);
     }
 
     // Write it to the file
@@ -75,7 +75,7 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
     let mut debounce = Instant::now();
     let mut f_out = ProgressStream::new(f_out, |total| {
         if (Instant::now() - debounce).as_millis() > 20 {
-            progress_cb((0.2 + ((total as f64 / total_size as f64) * 0.8)).min(0.9999));
+            progress_cb((0.1 + ((total as f64 / total_size as f64) * 0.9)).min(0.9999));
             debounce = Instant::now();
         }
     });

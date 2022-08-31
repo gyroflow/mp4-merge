@@ -10,6 +10,8 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
     let mut total_new_size = 0;
     let mut tl_track = track;
     while let Ok((typ, offs, size, header_size)) = read_box(d) {
+        if size == 0 || typ == 0 { break; }
+
         total_read_size += size;
         let mut new_size = size;
         if crate::has_children(typ) {

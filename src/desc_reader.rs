@@ -34,6 +34,7 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
     let mut total_read_size = 0;
     let mut tl_track = track;
     while let Ok((typ, offs, size, header_size)) = read_box(d) {
+        if size == 0 || typ == 0 { break; }
         total_read_size += size;
         if crate::has_children(typ) {
             read_desc(d, desc, tl_track, size - header_size as u64)?;
@@ -42,7 +43,7 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                 tl_track += 1;
             }
         } else {
-            log::debug!("Reading {}, offset: {}, size: {size}", typ_to_str(typ), offs);
+            log::debug!("Reading {}, offset: {}, size: {size}, header_size: {header_size}", typ_to_str(typ), offs);
             let org_pos = d.stream_position()?;
             if typ == fourcc("mdat") {
                 desc.mdat_position.push((None, org_pos, size - header_size as u64));
