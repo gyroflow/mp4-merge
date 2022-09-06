@@ -96,7 +96,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
             output_file.write(&new_typ.to_be_bytes())?;
             output_file.write(&0u32.to_be_bytes())?; // flags
 
-            let track_desc = desc.moov_tracks.get(tl_track).unwrap();
+            let track_desc = desc.moov_tracks.get_mut(tl_track).unwrap();
             if typ == fourcc("stts") {
                 let mut new_stts: Vec<(u32, u32)> = Vec::with_capacity(track_desc.stts.len());
                 let mut prev_delta = None;
@@ -129,6 +129,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
             if typ == fourcc("stco") || typ == fourcc("co64") {
                 output_file.write_u32::<BigEndian>(track_desc.stco.len() as u32)?;
                 new_size += 4;
+                track_desc.co64_final_position = output_file.stream_position()?;
                 for x in &track_desc.stco {
                     output_file.write_u64::<BigEndian>(*x + desc.mdat_final_position)?;
                     new_size += 8;

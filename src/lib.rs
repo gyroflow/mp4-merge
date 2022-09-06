@@ -3,7 +3,7 @@
 
 use std::io::{ Read, Seek, Result };
 use std::path::{ Path, PathBuf };
-use byteorder::{ ReadBytesExt, BigEndian };
+use byteorder::{ ReadBytesExt, WriteBytesExt, BigEndian };
 use std::time::Instant;
 
 mod desc_reader;
@@ -56,6 +56,20 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
         let mut fs = std::fs::File::open(path)?;
         total_size += fs.metadata()?.len();
 
+        { // Find mdat first
+            while let Ok((typ, offs, size, header_size)) = read_box(&mut fs) {
+                let org_pos = fs.stream_position()?;
+                if typ == fourcc("mdat") {
+                    log::debug!("Reading {}, offset: {}, size: {size}, header_size: {header_size}", typ_to_str(typ), offs);
+                    desc.mdat_position.push((None, org_pos, size - header_size as u64));
+                    desc.mdat_final_position = org_pos;
+                    break;
+                }
+                fs.seek(std::io::SeekFrom::Start(org_pos + size - header_size as u64))?;
+            }
+            fs.seek(std::io::SeekFrom::Start(0))?;
+        }
+
         desc_reader::read_desc(&mut fs, &mut desc, 0, u64::MAX)?;
 
         if let Some(mdat) = desc.mdat_position.last_mut() {
@@ -81,6 +95,15 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
         }
     });
     writer::rewrite_from_desc(&mut f1, &mut f_out, &mut desc, 0, u64::MAX).unwrap();
+
+    // Patch final mdat positions
+    for track in &desc.moov_tracks {
+        f_out.seek(std::io::SeekFrom::Start(track.co64_final_position))?;
+        for x in &track.stco {
+            f_out.write_u64::<BigEndian>(*x + desc.mdat_final_position)?;
+        }
+    }
+
     progress_cb(1.0);
 
     Ok(())

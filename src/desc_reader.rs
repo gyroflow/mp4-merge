@@ -21,6 +21,7 @@ pub struct TrackDesc {
     pub stsz_sample_size: u32,
     pub stsz_count: u32,
     pub stsc: Vec<(u32, u32, u32)>, // first_chunk, samples_per_chunk, sample_description_index
+    pub co64_final_position: u64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -47,10 +48,10 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
         } else {
             log::debug!("Reading {}, offset: {}, size: {size}, header_size: {header_size}", typ_to_str(typ), offs);
             let org_pos = d.stream_position()?;
-            if typ == fourcc("mdat") {
-                desc.mdat_position.push((None, org_pos, size - header_size as u64));
-                desc.mdat_final_position = org_pos;
-            }
+            // if typ == fourcc("mdat") {
+            //     desc.mdat_position.push((None, org_pos, size - header_size as u64));
+            //     desc.mdat_final_position = org_pos;
+            // }
             if typ == fourcc("mvhd") || typ == fourcc("tkhd") || typ == fourcc("mdhd") {
                 let (v, _flags) = (d.read_u8()?, d.read_u24::<BigEndian>()?);
                 if typ == fourcc("mvhd") {
