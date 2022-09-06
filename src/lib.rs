@@ -62,7 +62,8 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
             mdat.0 = Some(PathBuf::from(path));
             desc.mdat_offset += mdat.2;
             for t in &mut desc.moov_tracks {
-                t.stss_offset = t.stsz_count;
+                t.sample_offset = t.stsz_count;
+                t.chunk_offset = t.stco.len() as u32;
             }
         }
 

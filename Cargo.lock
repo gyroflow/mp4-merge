@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "mp4-merge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "byteorder",
  "log",

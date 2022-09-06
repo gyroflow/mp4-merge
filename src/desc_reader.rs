@@ -16,9 +16,11 @@ pub struct TrackDesc {
     pub stco: Vec<u64>,
     pub stss: Vec<u32>,
     pub sdtp: Vec<u8>,
-    pub stss_offset: u32,
+    pub sample_offset: u32,
+    pub chunk_offset: u32,
     pub stsz_sample_size: u32,
     pub stsz_count: u32,
+    pub stsc: Vec<(u32, u32, u32)>, // first_chunk, samples_per_chunk, sample_description_index
 }
 
 #[derive(Default, Clone, Debug)]
@@ -66,7 +68,8 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                     }
                 }
             }
-            if typ == fourcc("elst") || typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") {
+            if typ == fourcc("elst") || typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") ||
+               typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") || typ == fourcc("stsc") {
                 let track_desc = desc.moov_tracks.get_mut(tl_track).unwrap();
                 let (v, _flags) = (d.read_u8()?, d.read_u24::<BigEndian>()?);
 
@@ -86,15 +89,20 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                     let count = size - header_size as u64 - 4;
                     for _ in 0..count { track_desc.sdtp.push(d.read_u8()?); }
                 }
-                if typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("stts") {
+                if typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("stts") || typ == fourcc("stsc") {
                     let count = d.read_u32::<BigEndian>()?;
                     let current_file_mdat_position = desc.mdat_position.last().unwrap().1;
                     let mdat_offset = desc.mdat_offset as i64 - current_file_mdat_position as i64;
                     for _ in 0..count {
-                        if typ == fourcc("stss") { track_desc.stss.push(d.read_u32::<BigEndian>()? + track_desc.stss_offset); }
+                        if typ == fourcc("stss") { track_desc.stss.push(d.read_u32::<BigEndian>()? + track_desc.sample_offset); }
                         if typ == fourcc("stco") { track_desc.stco.push((d.read_u32::<BigEndian>()? as i64 + mdat_offset) as u64); }
                         if typ == fourcc("co64") { track_desc.stco.push((d.read_u64::<BigEndian>()? as i64 + mdat_offset) as u64); }
                         if typ == fourcc("stts") { track_desc.stts.push((d.read_u32::<BigEndian>()?, d.read_u32::<BigEndian>()?)); }
+                        if typ == fourcc("stsc") { track_desc.stsc.push((
+                            d.read_u32::<BigEndian>()? + track_desc.chunk_offset,
+                            d.read_u32::<BigEndian>()?,
+                            d.read_u32::<BigEndian>()?
+                        )); }
                     }
                 }
             }

@@ -84,7 +84,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
                 }
             }
 
-        } else if typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") {
+        } else if typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") || typ == fourcc("stsc") {
             log::debug!("Writing new {}, offset: {}, size: {size}", typ_to_str(typ), offs);
 
             d.seek(SeekFrom::Current(size as i64 - header_size))?;
@@ -136,6 +136,16 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
             }
             if typ == fourcc("sdtp") {
                 for x in &track_desc.sdtp { output_file.write_u8(*x)?; new_size += 1; }
+            }
+            if typ == fourcc("stsc") {
+                output_file.write_u32::<BigEndian>(track_desc.stsc.len() as u32)?;
+                new_size += 4;
+                for x in &track_desc.stsc {
+                    output_file.write_u32::<BigEndian>(x.0)?;
+                    output_file.write_u32::<BigEndian>(x.1)?;
+                    output_file.write_u32::<BigEndian>(x.2)?;
+                    new_size += 12;
+                }
             }
             patch_bytes(output_file, out_pos, &(new_size as u32).to_be_bytes())?;
         } else {
