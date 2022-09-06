@@ -1,3 +1,4 @@
 /target
+/tests
 *.mp4
 publish.sh
