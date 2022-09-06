@@ -30,7 +30,7 @@ mp4_merge IN_FILE1.mp4 IN_FILE2.mp4 IN_FILE3.mp4 ... --out result.mp4
 
 ```toml
 [dependencies]
-mp4-merge = "0.1.1"
+mp4-merge = "0.1.3"
 ```
 ```rust
 let files = ["IN_FILE1.mp4", "IN_FILE2.mp4"];
@@ -45,7 +45,7 @@ The idea is to merge the raw track data together, and then rewrite the `stbl` bo
 1. Scan every provided file and collect:
     - `mdat` offset and size
     - Duration stored in `mvhd`, `tkhd`, `mdhd` boxes
-    - `stbl` descriptions: `stts`, `stsz`, `stss`, `stco`/`co64`
+    - `stbl` descriptions: `stts`, `stsz`, `stss`, `stsc`, `stco`/`co64`
 2. Merge all these descriptions: sum durations, append `stbl` lists to each other and add chunk offsets based on previous file `mdat` size.
 3. Take the first file, go through every box and write it to the output file, while:
     - If `mdat`: write raw data from all `mdat` boxes from all files, and store it as a large box (64-bit)
