@@ -94,7 +94,7 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
             debounce = Instant::now();
         }
     });
-    writer::rewrite_from_desc(&mut f1, &mut f_out, &mut desc, 0, u64::MAX).unwrap();
+    writer::rewrite_from_desc(&mut f1, &mut f_out, &mut desc, 0, u64::MAX)?;
 
     // Patch final mdat positions
     for track in &desc.moov_tracks {

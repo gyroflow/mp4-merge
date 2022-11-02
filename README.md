@@ -53,3 +53,20 @@ The idea is to merge the raw track data together, and then rewrite the `stbl` bo
     - If `stbl`: write these boxes from scratch, using merged lists from the description
     - If `stco`: rewrite to `co64` to be able to fit more than 4 GB of data.
 4. Done
+
+<br>
+
+#### License
+
+<sup>
+Licensed under either of <a href="LICENSE-APACHE">Apache License, Version
+2.0</a> or <a href="LICENSE-MIT">MIT license</a> at your option.
+</sup>
+
+<br>
+
+<sub>
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
+</sub>
