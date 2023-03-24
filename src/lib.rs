@@ -27,9 +27,10 @@ const fn fourcc(s: &str) -> u32 {
     let s = s.as_bytes();
     (s[3] as u32) | ((s[2] as u32) << 8) | ((s[1] as u32) << 16) | ((s[0] as u32) << 24)
 }
-const fn has_children(typ: u32) -> bool {
+const fn has_children(typ: u32, is_read: bool) -> bool {
     typ == fourcc("moov") || typ == fourcc("trak") || typ == fourcc("edts") ||
-    typ == fourcc("mdia") || typ == fourcc("minf") || typ == fourcc("stbl")
+    typ == fourcc("mdia") || typ == fourcc("minf") || typ == fourcc("stbl") ||
+    (typ == fourcc("stsd") && is_read)
 }
 fn typ_to_str(typ: u32) -> String {
     unsafe { String::from_utf8_unchecked(vec![(typ >> 24) as u8, (typ >> 16) as u8, (typ >> 8) as u8, typ as u8 ]) }
@@ -70,7 +71,7 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
             fs.seek(std::io::SeekFrom::Start(0))?;
         }
 
-        desc_reader::read_desc(&mut fs, &mut desc, 0, u64::MAX)?;
+        desc_reader::read_desc(&mut fs, &mut desc, 0, u64::MAX, i)?;
 
         if let Some(mdat) = desc.mdat_position.last_mut() {
             mdat.0 = Some(PathBuf::from(path));

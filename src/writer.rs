@@ -14,7 +14,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
 
         total_read_size += size;
         let mut new_size = size;
-        if crate::has_children(typ) {
+        if crate::has_children(typ, false) {
             // Copy the header
             d.seek(SeekFrom::Current(-header_size))?;
             let out_pos = output_file.stream_position()?;
@@ -164,7 +164,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
     Ok(total_new_size)
 }
 
-fn patch_bytes<W: Write + Seek>(writer: &mut W, position: u64, bytes: &[u8]) -> Result<()> {
+pub fn patch_bytes<W: Write + Seek>(writer: &mut W, position: u64, bytes: &[u8]) -> Result<()> {
     let new_pos = writer.stream_position()?;
     writer.seek(SeekFrom::Start(position))?;
     writer.write(bytes)?;
