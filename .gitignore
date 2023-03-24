@@ -2,3 +2,4 @@
 /tests
 *.mp4
 publish.sh
+Cargo.lock
