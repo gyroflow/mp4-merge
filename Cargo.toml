@@ -10,7 +10,7 @@ readme = "README.md"
 
 [dependencies]
 byteorder = "1.4.3"
-log = "0.4.17"
+log = "0.4"
 
 [lib]
 name = "mp4_merge"
