@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright © 2022 Adrian <adrian.eddy at gmail>
 
-use std::io::{ Read, Seek, Result };
-use std::path::{ Path, PathBuf };
+use std::io::{ Read, Seek, Write, Result };
+use std::path::Path;
 use byteorder::{ ReadBytesExt, WriteBytesExt, BigEndian };
 use std::time::Instant;
 
@@ -48,14 +48,25 @@ pub fn read_box<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64, u64, i64)> 
     }
 }
 
-pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[P], output_file: P, progress_cb: F) -> Result<()> {
+pub fn join_files<P: AsRef<Path>, F: Fn(f64)>(files: &[P], output_file: P, progress_cb: F) -> Result<()> {
+    let mut open_files = Vec::with_capacity(files.len());
+    for x in files {
+        let f = std::fs::File::open(x)?;
+        let size = f.metadata()?.len() as usize;
+        open_files.push((f, size));
+    }
+    join_file_streams(&mut open_files, std::fs::File::create(output_file)?, progress_cb)
+}
+
+pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(files: &mut [(I, usize)], output_file: O, progress_cb: F) -> Result<()> {
     // Get the merged description from all source files
     let mut desc = desc_reader::Desc::default();
     desc.moov_tracks.resize(10, Default::default());
     let mut total_size = 0;
-    for (i, path) in files.iter().enumerate() {
-        let mut fs = std::fs::File::open(path)?;
-        total_size += fs.metadata()?.len();
+    let num_files = files.len() as f64;
+    for (i, fs) in files.iter_mut().enumerate() {
+        total_size += fs.1;
+        let mut fs = &mut fs.0;
 
         { // Find mdat first
             while let Ok((typ, offs, size, header_size)) = read_box(&mut fs) {
@@ -74,7 +85,7 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
         desc_reader::read_desc(&mut fs, &mut desc, 0, u64::MAX, i)?;
 
         if let Some(mdat) = desc.mdat_position.last_mut() {
-            mdat.0 = Some(PathBuf::from(path));
+            mdat.0 = Some(i);
             desc.mdat_offset += mdat.2;
             for t in &mut desc.moov_tracks {
                 t.sample_offset = t.stsz_count;
@@ -82,20 +93,20 @@ pub fn join_files<P: AsRef<Path> + AsRef<std::ffi::OsStr>, F: Fn(f64)>(files: &[
             }
         }
 
-        progress_cb(((i as f64 + 1.0) / files.len() as f64) * 0.1);
+        progress_cb(((i as f64 + 1.0) / num_files) * 0.1);
     }
 
     // Write it to the file
-    let mut f1 = std::fs::File::open(&files[0])?;
-    let f_out = std::fs::File::create(output_file)?;
     let mut debounce = Instant::now();
-    let mut f_out = ProgressStream::new(f_out, |total| {
+    let mut f_out = ProgressStream::new(output_file, |total| {
         if (Instant::now() - debounce).as_millis() > 20 {
             progress_cb((0.1 + ((total as f64 / total_size as f64) * 0.9)).min(0.9999));
             debounce = Instant::now();
         }
     });
-    writer::rewrite_from_desc(&mut f1, &mut f_out, &mut desc, 0, u64::MAX)?;
+
+    writer::get_first(files).seek(std::io::SeekFrom::Start(0))?;
+    writer::rewrite_from_desc(files, &mut f_out, &mut desc, 0, u64::MAX)?;
 
     // Patch final mdat positions
     for track in &desc.moov_tracks {

@@ -5,21 +5,24 @@ use std::io::{ Read, Write, Seek, Result, SeekFrom };
 use byteorder::{ ReadBytesExt, WriteBytesExt, BigEndian };
 use crate::{ fourcc, read_box, typ_to_str, desc_reader::Desc };
 
-pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file: &mut W, desc: &mut Desc, track: usize, max_read: u64) -> Result<u64> {
+pub(crate) fn get_first<R: Read + Seek>(files: &mut [(R, usize)]) -> &mut R { files.get_mut(0).map(|x| &mut x.0).unwrap() }
+
+pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize)], output_file: &mut W, desc: &mut Desc, track: usize, max_read: u64) -> Result<u64> {
     let mut total_read_size = 0;
     let mut total_new_size = 0;
     let mut tl_track = track;
-    while let Ok((typ, offs, size, header_size)) = read_box(d) {
+    while let Ok((typ, offs, size, header_size)) = read_box(get_first(files)) {
         if size == 0 || typ == 0 { break; }
 
         total_read_size += size;
         let mut new_size = size;
         if crate::has_children(typ, false) {
+            let d = get_first(files);
             // Copy the header
             d.seek(SeekFrom::Current(-header_size))?;
             let out_pos = output_file.stream_position()?;
             std::io::copy(&mut d.take(header_size as u64), output_file)?;
-            new_size = rewrite_from_desc(d, output_file, desc, tl_track, size - header_size as u64)?;
+            new_size = rewrite_from_desc(files, output_file, desc, tl_track, size - header_size as u64)?;
             new_size += header_size as u64;
 
             if typ == fourcc("trak") {
@@ -33,29 +36,33 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
         } else if typ == fourcc("mdat") {
             log::debug!("Merging mdat's, offset: {}, size: {size}", offs);
 
-            output_file.write(&1u32.to_be_bytes())?;
-            output_file.write(&fourcc("mdat").to_be_bytes())?;
+            output_file.write_all(&1u32.to_be_bytes())?;
+            output_file.write_all(&fourcc("mdat").to_be_bytes())?;
             let pos = output_file.stream_position()?;
-            output_file.write(&0u64.to_be_bytes())?;
+            output_file.write_all(&0u64.to_be_bytes())?;
             new_size = 16;
 
             desc.mdat_final_position = output_file.stream_position()?;
 
             // Merge all mdats
-            for (fpath, mo, ms) in &desc.mdat_position {
-                if let Some(fpath) = fpath {
-                    let mut f = std::fs::File::open(fpath)?;
-                    f.seek(SeekFrom::Start(*mo))?;
-                    std::io::copy(&mut f.take(*ms), output_file)?;
-                    new_size += ms;
+            for (file_index, mo, ms) in &desc.mdat_position {
+                if let Some(file_index) = file_index {
+                    if let Some(f) = files.get_mut(*file_index).map(|x| &mut x.0) {
+                        let prev_pos = f.stream_position()?;
+                        f.seek(SeekFrom::Start(*mo))?;
+                        std::io::copy(&mut f.take(*ms), output_file)?;
+                        f.seek(SeekFrom::Start(prev_pos))?;
+                        new_size += ms;
+                    }
                 }
             }
             patch_bytes(output_file, pos, &new_size.to_be_bytes())?;
 
-            d.seek(SeekFrom::Current(size as i64 - header_size))?;
+            get_first(files).seek(SeekFrom::Current(size as i64 - header_size))?;
 
         } else if typ == fourcc("mvhd") || typ == fourcc("tkhd") || typ == fourcc("mdhd") || typ == fourcc("elst") {
             log::debug!("Writing {} with patched duration, offset: {}, size: {size}", typ_to_str(typ), offs);
+            let d = get_first(files);
 
             let (v, _flags) = (d.read_u8()?, d.read_u24::<BigEndian>()?);
 
@@ -87,14 +94,14 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
         } else if typ == fourcc("stts") || typ == fourcc("stsz") || typ == fourcc("stss") || typ == fourcc("stco") || typ == fourcc("co64") || typ == fourcc("sdtp") || typ == fourcc("stsc") {
             log::debug!("Writing new {}, offset: {}, size: {size}", typ_to_str(typ), offs);
 
-            d.seek(SeekFrom::Current(size as i64 - header_size))?;
+            get_first(files).seek(SeekFrom::Current(size as i64 - header_size))?;
 
             let out_pos = output_file.stream_position()?;
             new_size = 12;
-            output_file.write(&0u32.to_be_bytes())?;
+            output_file.write_all(&0u32.to_be_bytes())?;
             let new_typ = if typ == fourcc("stco") { fourcc("co64") } else { typ };
-            output_file.write(&new_typ.to_be_bytes())?;
-            output_file.write(&0u32.to_be_bytes())?; // flags
+            output_file.write_all(&new_typ.to_be_bytes())?;
+            output_file.write_all(&0u32.to_be_bytes())?; // flags
 
             let track_desc = desc.moov_tracks.get_mut(tl_track).unwrap();
             if typ == fourcc("stts") {
@@ -102,7 +109,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
                 let mut prev_delta = None;
                 for x in &track_desc.stts {
                     if let Some(prev_delta) = prev_delta {
-                        if prev_delta == x.1 { (*new_stts.last_mut().unwrap()).0 += x.0; continue; }
+                        if prev_delta == x.1 { new_stts.last_mut().unwrap().0 += x.0; continue; }
                     }
                     prev_delta = Some(x.1);
                     new_stts.push(*x);
@@ -119,12 +126,12 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
                 output_file.write_u32::<BigEndian>(track_desc.stsz_sample_size)?; // sample_size
                 output_file.write_u32::<BigEndian>(track_desc.stsz_count)?;
                 new_size += 8;
-                for x in &track_desc.stsz { output_file.write_u32::<BigEndian>(*x as u32)?; new_size += 4; }
+                for x in &track_desc.stsz { output_file.write_u32::<BigEndian>(*x)?; new_size += 4; }
             }
             if typ == fourcc("stss") {
                 output_file.write_u32::<BigEndian>(track_desc.stss.len() as u32)?;
                 new_size += 4;
-                for x in &track_desc.stss { output_file.write_u32::<BigEndian>(*x as u32)?; new_size += 4; }
+                for x in &track_desc.stss { output_file.write_u32::<BigEndian>(*x)?; new_size += 4; }
             }
             if typ == fourcc("stco") || typ == fourcc("co64") {
                 output_file.write_u32::<BigEndian>(track_desc.stco.len() as u32)?;
@@ -151,6 +158,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
             patch_bytes(output_file, out_pos, &(new_size as u32).to_be_bytes())?;
         } else {
             log::debug!("Writing original {}, offset: {}, size: {size}", typ_to_str(typ), offs);
+            let d = get_first(files);
 
             // Copy without changes
             d.seek(SeekFrom::Current(-header_size))?;
@@ -167,7 +175,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(d: &mut R, output_file
 pub fn patch_bytes<W: Write + Seek>(writer: &mut W, position: u64, bytes: &[u8]) -> Result<()> {
     let new_pos = writer.stream_position()?;
     writer.seek(SeekFrom::Start(position))?;
-    writer.write(bytes)?;
+    writer.write_all(bytes)?;
     writer.seek(SeekFrom::Start(new_pos))?;
     Ok(())
 }

@@ -2,7 +2,6 @@
 // Copyright © 2022 Adrian <adrian.eddy at gmail>
 
 use std::io::{ Read, Seek, Result, SeekFrom };
-use std::path::PathBuf;
 use byteorder::{ ReadBytesExt, BigEndian };
 use crate::{ fourcc, read_box, typ_to_str };
 
@@ -27,7 +26,7 @@ pub struct TrackDesc {
 
 #[derive(Default, Clone, Debug)]
 pub struct Desc {
-    pub mdat_position: Vec<(Option<PathBuf>, u64, u64)>, // file path, offset, size
+    pub mdat_position: Vec<(Option<usize>, u64, u64)>, // file path, offset, size
     pub moov_mvhd_duration: u64,
     pub moov_tracks: Vec<TrackDesc>,
     pub mdat_offset: u64,
