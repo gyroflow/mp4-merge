@@ -11,6 +11,7 @@ readme = "README.md"
 [dependencies]
 byteorder = "1.4.3"
 log = "0.4"
+filetime_creation = "0.1"
 
 [lib]
 name = "mp4_merge"

@@ -2,7 +2,7 @@
 // Copyright © 2022 Adrian <adrian.eddy at gmail>
 
 use std::io::{ Read, Seek, Write, Result };
-use std::path::Path;
+use std::path::*;
 use byteorder::{ ReadBytesExt, WriteBytesExt, BigEndian };
 use std::time::Instant;
 
@@ -48,7 +48,7 @@ pub fn read_box<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64, u64, i64)> 
     }
 }
 
-pub fn join_files<P: AsRef<Path>, F: Fn(f64)>(files: &[P], output_file: P, progress_cb: F) -> Result<()> {
+pub fn join_files<P: AsRef<Path>, F: Fn(f64)>(files: &[P], output_file: &P, progress_cb: F) -> Result<()> {
     let mut open_files = Vec::with_capacity(files.len());
     for x in files {
         let f = std::fs::File::open(x)?;
@@ -119,4 +119,30 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
     progress_cb(1.0);
 
     Ok(())
+}
+
+pub fn update_file_times(input_path: &PathBuf, output_path: &PathBuf) {
+    if let Err(e) = || -> std::io::Result<()> {
+        let org_time =
+            filetime_creation::FileTime::from_creation_time(&std::fs::metadata(&input_path)?)
+                .ok_or(std::io::ErrorKind::Other)?;
+        if cfg!(target_os = "windows") {
+            ::log::debug!(
+                "Updating creation time of {} to {}",
+                output_path.display(),
+                org_time.to_string()
+            );
+            filetime_creation::set_file_ctime(output_path, org_time)?;
+        } else {
+            ::log::debug!(
+                "Updating modification time of {} to {}",
+                output_path.display(),
+                org_time.to_string()
+            );
+            filetime_creation::set_file_mtime(output_path, org_time)?;
+        }
+        Ok(())
+    }() {
+        ::log::warn!("Failed to update file times: {e:?}");
+    }
 }
