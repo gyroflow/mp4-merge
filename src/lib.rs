@@ -3,12 +3,13 @@
 
 use std::io::{ Read, Seek, Write, Result };
 use std::path::*;
-use byteorder::{ ReadBytesExt, WriteBytesExt, BigEndian };
+use byteorder::{ BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt };
 use std::time::Instant;
 
 mod desc_reader;
 mod progress_stream;
 mod writer;
+mod insta360;
 use progress_stream::*;
 
 // We need to:
@@ -33,7 +34,10 @@ const fn has_children(typ: u32, is_read: bool) -> bool {
     (typ == fourcc("stsd") && is_read)
 }
 fn typ_to_str(typ: u32) -> String {
-    unsafe { String::from_utf8_unchecked(vec![(typ >> 24) as u8, (typ >> 16) as u8, (typ >> 8) as u8, typ as u8 ]) }
+    match String::from_utf8(vec![(typ >> 24) as u8, (typ >> 16) as u8, (typ >> 8) as u8, typ as u8 ]) {
+        Ok(x) => x,
+        Err(_) => format!("{:08X}", typ)
+    }
 }
 
 pub fn read_box<R: Read + Seek>(reader: &mut R) -> Result<(u32, u64, u64, i64)> {
@@ -64,9 +68,11 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
     desc.moov_tracks.resize(10, Default::default());
     let mut total_size = 0;
     let num_files = files.len() as f64;
+    let mut insta360_max_read = None;
     for (i, fs) in files.iter_mut().enumerate() {
-        total_size += fs.1;
+        let filesize = fs.1;
         let mut fs = &mut fs.0;
+        total_size += filesize;
 
         { // Find mdat first
             while let Ok((typ, offs, size, header_size)) = read_box(&mut fs) {
@@ -79,6 +85,17 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
                 }
                 fs.seek(std::io::SeekFrom::Start(org_pos + size - header_size as u64))?;
             }
+
+            if insta360_max_read.is_none() {
+                fs.seek(std::io::SeekFrom::End(-40))?;
+                let mut buf = vec![0u8; 40];
+                fs.read_exact(&mut buf)?;
+                // Check if it's Insta360
+                if &buf[8..] == insta360::MAGIC {
+                    insta360_max_read = Some(filesize as u64 - (&buf[..]).read_u32::<LittleEndian>()? as u64);
+                }
+            }
+
             fs.seek(std::io::SeekFrom::Start(0))?;
         }
 
@@ -106,7 +123,7 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
     });
 
     writer::get_first(files).seek(std::io::SeekFrom::Start(0))?;
-    writer::rewrite_from_desc(files, &mut f_out, &mut desc, 0, u64::MAX)?;
+    writer::rewrite_from_desc(files, &mut f_out, &mut desc, 0, insta360_max_read.unwrap_or(u64::MAX))?;
 
     // Patch final mdat positions
     for track in &desc.moov_tracks {
@@ -116,6 +133,13 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
         }
     }
 
+    if insta360_max_read.is_some() {
+        // Merge Insta360 metadata
+        f_out.seek(std::io::SeekFrom::End(0))?;
+        let offsets = insta360::get_insta360_offsets(files)?;
+        insta360::merge_metadata(files, &offsets, f_out)?;
+    }
+
     progress_cb(1.0);
 
     Ok(())
@@ -123,22 +147,12 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
 
 pub fn update_file_times(input_path: &PathBuf, output_path: &PathBuf) {
     if let Err(e) = || -> std::io::Result<()> {
-        let org_time =
-            filetime_creation::FileTime::from_creation_time(&std::fs::metadata(&input_path)?)
-                .ok_or(std::io::ErrorKind::Other)?;
+        let org_time = filetime_creation::FileTime::from_creation_time(&std::fs::metadata(&input_path)?).ok_or(std::io::ErrorKind::Other)?;
         if cfg!(target_os = "windows") {
-            ::log::debug!(
-                "Updating creation time of {} to {}",
-                output_path.display(),
-                org_time.to_string()
-            );
+            ::log::debug!("Updating creation time of {} to {}", output_path.display(), org_time.to_string());
             filetime_creation::set_file_ctime(output_path, org_time)?;
         } else {
-            ::log::debug!(
-                "Updating modification time of {} to {}",
-                output_path.display(),
-                org_time.to_string()
-            );
+            ::log::debug!("Updating modification time of {} to {}", output_path.display(), org_time.to_string());
             filetime_creation::set_file_mtime(output_path, org_time)?;
         }
         Ok(())

@@ -9,9 +9,9 @@ repository = "https://github.com/gyroflow/mp4-merge"
 readme = "README.md"
 
 [dependencies]
-byteorder = "1.4.3"
+byteorder = "1.5.0"
 log = "0.4"
-filetime_creation = "0.1"
+filetime_creation = "0.2"
 
 [lib]
 name = "mp4_merge"
