@@ -75,8 +75,15 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
                     let (v, _flags) = (d.read_u8()?, d.read_u24::<BigEndian>()?);
 
                     if typ == fourcc("elst") {
-                        d.seek(SeekFrom::Current(4))?; // Skip fields
-                        track_desc.elst_segment_duration += if v == 1 { d.read_u64::<BigEndian>()? } else { d.read_u32::<BigEndian>()? as u64 };
+                        let entry_count = d.read_u32::<BigEndian>()?;
+                        for _ in 0..entry_count {
+                            let segment_duration = if v == 1 { d.read_u64::<BigEndian>()? } else { d.read_u32::<BigEndian>()? as u64 };
+                            let media_time       = if v == 1 { d.read_i64::<BigEndian>()? } else { d.read_i32::<BigEndian>()? as i64 };
+                            d.seek(SeekFrom::Current(4))?; // Skip Media rate
+                            if media_time != -1 {
+                                track_desc.elst_segment_duration += segment_duration;
+                            }
+                        }
                     }
                     if typ == fourcc("stsz") {
                         track_desc.stsz_sample_size = d.read_u32::<BigEndian>()?;
