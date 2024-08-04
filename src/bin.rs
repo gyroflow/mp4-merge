@@ -34,7 +34,7 @@ fn main() {
     if output_file.is_none() { eprintln!("Output file not specified!"); return; }
 
     let final_output_file = output_file.as_ref().unwrap();
-    
+
     println!("Output file {:?}", final_output_file);
 
     join_files(&files, final_output_file, |progress| {
