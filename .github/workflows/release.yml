@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: [ 'v*' ]
+    #tags: [ 'v*' ]
 
 jobs:
   build:
@@ -59,7 +59,6 @@ jobs:
       - name: Save Binaries
         uses: actions/upload-artifact@v4
         with:
-          name: mp4_merge
           path: dist/mp4_merge*
 
   github_release:
@@ -70,7 +69,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: mp4_merge
+          name: mp4_merge*
 
       - run: ls -l
 
