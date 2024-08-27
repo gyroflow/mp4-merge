@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    #tags: [ 'v*' ]
+    tags: [ 'v*' ]
 
 jobs:
   build:
@@ -69,8 +69,6 @@ jobs:
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
-        with:
-          name: mp4_merge-${{ matrix.targets.name }}
 
       - run: ls -l
 
