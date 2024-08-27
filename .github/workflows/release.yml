@@ -57,7 +57,7 @@ jobs:
           mv target/${{ matrix.targets.target }}/release/mp4_merge${{ matrix.targets.ext }} dist/mp4_merge-${{ matrix.targets.name }}${{ matrix.targets.ext }}
 
       - name: Save Binaries
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: mp4_merge
           path: dist/mp4_merge*
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: mp4_merge
 

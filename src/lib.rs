@@ -71,7 +71,7 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
     let mut insta360_max_read = None;
     for (i, fs) in files.iter_mut().enumerate() {
         let filesize = fs.1;
-        let mut fs = &mut fs.0;
+        let mut fs = std::io::BufReader::with_capacity(16*1024, &mut fs.0);
         total_size += filesize;
 
         { // Find mdat first
@@ -115,12 +115,13 @@ pub fn join_file_streams<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek>(fil
 
     // Write it to the file
     let mut debounce = Instant::now();
-    let mut f_out = ProgressStream::new(output_file, |total| {
-        if (Instant::now() - debounce).as_millis() > 20 {
+    let f_out = ProgressStream::new(output_file, |total| {
+        if (Instant::now() - debounce).as_millis() > 100 {
             progress_cb((0.1 + ((total as f64 / total_size as f64) * 0.9)).min(0.9999));
             debounce = Instant::now();
         }
     });
+    let mut f_out = std::io::BufWriter::with_capacity(64*1024, f_out);
 
     writer::get_first(files).seek(std::io::SeekFrom::Start(0))?;
     writer::rewrite_from_desc(files, &mut f_out, &mut desc, 0, insta360_max_read.unwrap_or(u64::MAX))?;

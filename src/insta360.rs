@@ -8,6 +8,7 @@ pub const MAGIC: &[u8] = b"8db42d694ccc418790edff439fe026bf";
 pub fn get_insta360_offsets<R: Read + Seek>(files: &mut [(R, usize)]) -> Result<Vec<BTreeMap<u64, (u32, u8, u8, i64)>>> {
     let mut ret = Vec::new();
     for (ref mut stream, size) in files {
+        let mut stream = std::io::BufReader::with_capacity(16*1024, stream);
 
         let mut buf = vec![0u8; HEADER_SIZE];
         stream.seek(SeekFrom::End(-(HEADER_SIZE as i64)))?;
