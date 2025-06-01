@@ -34,8 +34,10 @@ jobs:
       - name: Setup target ${{ matrix.targets.target }}
         if: ${{ matrix.targets.target == 'aarch64-apple-darwin' }}
         run: |
-          echo "SDKROOT=$(xcrun -sdk macosx13.0 --show-sdk-path)" >> $GITHUB_ENV
-          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx13.0 --show-sdk-platform-version)" >> $GITHUB_ENV
+          xcrun --show-sdk-path
+          xcodebuild -sdk -version
+          echo "SDKROOT=$(xcrun -sdk macosx13.3 --show-sdk-path)" >> $GITHUB_ENV
+          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx13.3 --show-sdk-platform-version)" >> $GITHUB_ENV
 
       - name: Build mp4_merge
         env:
