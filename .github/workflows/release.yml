@@ -36,8 +36,8 @@ jobs:
         run: |
           xcrun --show-sdk-path
           xcodebuild -sdk -version
-          echo "SDKROOT=$(xcrun -sdk macosx13.3 --show-sdk-path)" >> $GITHUB_ENV
-          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx13.3 --show-sdk-platform-version)" >> $GITHUB_ENV
+          echo "SDKROOT=$(xcrun -sdk macosx14.5 --show-sdk-path)" >> $GITHUB_ENV
+          echo "MACOSX_DEPLOYMENT_TARGET=$(xcrun -sdk macosx14.5 --show-sdk-platform-version)" >> $GITHUB_ENV
 
       - name: Build mp4_merge
         env:
