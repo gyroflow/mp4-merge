@@ -9,6 +9,7 @@ use crate::{ fourcc, read_box, typ_to_str };
 pub struct TrackDesc {
     pub tkhd_duration: u64,
     pub elst_segment_duration: u64,
+    pub mdhd_timescale: u32,
     pub mdhd_duration: u64,
     pub stts: Vec<(u32, u32)>,
     pub stsz: Vec<u32>,
@@ -27,6 +28,8 @@ pub struct TrackDesc {
 #[derive(Default, Clone, Debug)]
 pub struct Desc {
     pub mdat_position: Vec<(Option<usize>, u64, u64)>, // file path, offset, size
+    pub mvhd_timescale_per_file: Vec<u32>,
+    pub moov_mvhd_timescale: u32,
     pub moov_mvhd_duration: u64,
     pub moov_tracks: Vec<TrackDesc>,
     pub mdat_offset: u64,
@@ -36,6 +39,7 @@ pub struct Desc {
 pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_read: u64, file_index: usize) -> Result<()> {
     let mut tl_track = track;
     let start_offs = d.stream_position()?;
+    desc.mvhd_timescale_per_file.push(0);
     while let Ok((typ, offs, size, header_size)) = read_box(d) {
         if size == 0 || typ == 0 { continue; }
         if crate::has_children(typ, true) {
@@ -54,17 +58,32 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
             if typ == fourcc("mvhd") || typ == fourcc("tkhd") || typ == fourcc("mdhd") {
                 let (v, _flags) = (d.read_u8()?, d.read_u24::<BigEndian>()?);
                 if typ == fourcc("mvhd") {
-                    desc.moov_mvhd_duration += if v == 1 { d.seek(SeekFrom::Current(8+8+4))?; d.read_u64::<BigEndian>()? }
-                                               else      { d.seek(SeekFrom::Current(4+4+4))?; d.read_u32::<BigEndian>()? as u64 };
+                    let timescale = if v == 1 { d.seek(SeekFrom::Current(8+8))?; d.read_u32::<BigEndian>()? }
+                                    else      { d.seek(SeekFrom::Current(4+4))?; d.read_u32::<BigEndian>()? };
+                    let duration = if v == 1 { d.read_u64::<BigEndian>()? }
+                                   else      { d.read_u32::<BigEndian>()? as u64 };
+                    if desc.moov_mvhd_timescale == 0 {
+                        desc.moov_mvhd_timescale = timescale;
+                    }
+                    desc.mvhd_timescale_per_file[file_index] = timescale;
+                    desc.moov_mvhd_duration += ((duration as f64 / timescale as f64) * desc.moov_mvhd_timescale as f64).ceil() as u64;
                 }
                 if let Some(track_desc) = desc.moov_tracks.get_mut(tl_track) {
                     if typ == fourcc("tkhd") {
-                        track_desc.tkhd_duration += if v == 1 { d.seek(SeekFrom::Current(8+8+4+4))?; d.read_u64::<BigEndian>()? }
-                                                    else      { d.seek(SeekFrom::Current(4+4+4+4))?; d.read_u32::<BigEndian>()? as u64 };
+                        let duration = if v == 1 { d.seek(SeekFrom::Current(8+8+4+4))?; d.read_u64::<BigEndian>()? }
+                                       else      { d.seek(SeekFrom::Current(4+4+4+4))?; d.read_u32::<BigEndian>()? as u64 };
+                        track_desc.tkhd_duration += ((duration as f64 / *desc.mvhd_timescale_per_file.get(file_index).ok_or(std::io::Error::other("Invalid index"))? as f64) * desc.moov_mvhd_timescale as f64).ceil() as u64;
                     }
                     if typ == fourcc("mdhd") {
-                        track_desc.mdhd_duration += if v == 1 { d.seek(SeekFrom::Current(8+8+4))?; d.read_u64::<BigEndian>()? }
-                                                    else      { d.seek(SeekFrom::Current(4+4+4))?; d.read_u32::<BigEndian>()? as u64 };
+                        let timescale = if v == 1 { d.seek(SeekFrom::Current(8+8))?; d.read_u32::<BigEndian>()? }
+                                        else      { d.seek(SeekFrom::Current(4+4))?; d.read_u32::<BigEndian>()? };
+                        let duration = if v == 1 { d.read_u64::<BigEndian>()? }
+                                       else      { d.read_u32::<BigEndian>()? as u64 };
+                        if track_desc.mdhd_timescale == 0 {
+                            track_desc.mdhd_timescale = timescale;
+                        }
+                        let add_duration = ((duration as f64 / timescale as f64) * track_desc.mdhd_timescale as f64).ceil() as u64;
+                        track_desc.mdhd_duration += add_duration;
                     }
                 }
             }

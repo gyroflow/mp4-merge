@@ -86,8 +86,13 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
                     else      { patch_bytes(output_file, pos+4+4+4, &(track_desc.mdhd_duration as u32).to_be_bytes())?; }
                 }
                 if typ == fourcc("elst") {
-                    if v == 1 { patch_bytes(output_file, pos+4, &track_desc.elst_segment_duration.to_be_bytes())?; }
-                    else      { patch_bytes(output_file, pos+4, &(track_desc.elst_segment_duration as u32).to_be_bytes())?; }
+                    let mut elst_duration = track_desc.elst_segment_duration;
+                    if elst_duration != 0 && track_desc.mdhd_duration > elst_duration {
+                        elst_duration = track_desc.mdhd_duration;
+                    }
+
+                    if v == 1 { patch_bytes(output_file, pos+4, &elst_duration.to_be_bytes())?; }
+                    else      { patch_bytes(output_file, pos+4, &(elst_duration as u32).to_be_bytes())?; }
                 }
             }
 
