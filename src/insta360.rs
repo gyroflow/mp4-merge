@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, io::*};
 use byteorder::{ LittleEndian, ReadBytesExt, WriteBytesExt };
-use crate::writer::get_first;
+use crate::{ copy_exact, writer::get_first };
 
 pub const HEADER_SIZE: usize = 32 + 4 + 4 + 32; // padding(32), size(4), version(4), magic(32)
 pub const MAGIC: &[u8] = b"8db42d694ccc418790edff439fe026bf";
@@ -77,7 +77,7 @@ pub fn merge_metadata<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize)],
         data_version = *ver;
         let first_stream = get_first(files);
         first_stream.seek(SeekFrom::Start(*offset))?;
-        std::io::copy(&mut first_stream.take(*size as u64), &mut f_out)?;
+        copy_exact(first_stream, *size as u64, &mut f_out)?;
 
         let format2 = first_stream.read_u8()?;
         let id2     = first_stream.read_u8()?;
@@ -95,7 +95,7 @@ pub fn merge_metadata<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize)],
                     if id2 == *id {
                         let stream_i = files.get_mut(file_i).map(|x| &mut x.0).unwrap();
                         stream_i.seek(SeekFrom::Start(*offset))?;
-                        std::io::copy(&mut stream_i.take(*size as u64), &mut f_out)?;
+                        copy_exact(stream_i, *size as u64, &mut f_out)?;
                         size2 += *size as i64;
                     }
                 }
@@ -111,7 +111,7 @@ pub fn merge_metadata<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize)],
     f_out.write_u128::<LittleEndian>(0)?; // padding
     f_out.write_u32::<LittleEndian>(total_size as u32 + 72)?;
     f_out.write_u32::<LittleEndian>(data_version)?; // version
-    f_out.write(MAGIC)?;
+    f_out.write_all(MAGIC)?;
 
     Ok(())
 }

@@ -21,26 +21,32 @@ fn main() {
         }
         let p = Path::new(&arg);
         if !p.exists() {
+            // Not merged without it: the merge would lack a part
             eprintln!("File doesn't exist {:?}", p);
-            continue;
+            std::process::exit(1);
         }
         println!("Merging file {:?}", p);
         files.push(p.to_owned());
         if output_file.is_none() {
-            output_file = Some(p.with_file_name(format!("{}_joined.mp4", p.file_name().unwrap().to_str().unwrap())));
+            let mut name = p.file_name().unwrap_or_default().to_owned();
+            name.push("_joined.mp4");
+            output_file = Some(p.with_file_name(name));
         }
     }
-    if files.is_empty() { eprintln!("No input files!"); return; }
-    if output_file.is_none() { eprintln!("Output file not specified!"); return; }
+    if files.is_empty() { eprintln!("No input files!"); std::process::exit(1); }
+    if output_file.is_none() { eprintln!("Output file not specified!"); std::process::exit(1); }
 
     let final_output_file = output_file.as_ref().unwrap();
 
     println!("Output file {:?}", final_output_file);
 
-    join_files(&files, final_output_file, |progress| {
+    if let Err(e) = join_files(&files, final_output_file, |progress| {
         print!("\rMerging... {:.2}%", progress * 100.0);
         std::io::stdout().flush().unwrap();
-    }).unwrap();
+    }) {
+        eprintln!("\rError: {e}                ");
+        std::process::exit(1);
+    }
 
     update_file_times(&files[0], final_output_file);
 
