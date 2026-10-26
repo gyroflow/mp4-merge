@@ -62,7 +62,7 @@ The idea is to merge the raw track data together, and then rewrite the `stbl` bo
     - If `stbl`: write these boxes from scratch, using merged lists from the description
     - If `mvex`: leave it out, as the merged file has no movie fragments
     - If `stco`: rewrite to `co64` to be able to fit more than 4 GB of data.
-    - If `moov/udta`: write it without mp4-trim's segment table (`MTRM`), which describes the frames of the file it was written into, not those of the merged one.
+    - If `moov/udta`: write it without the segment table (`MTRM`), which describes the frames of the file it was written into, not those of the merged one.
     - Any read or write error stops the merge with that error, and so does a file that ends before its boxes do.
 5. Done
 

@@ -49,7 +49,7 @@ pub fn rewrite_from_desc<R: Read + Seek, W: Write + Seek>(files: &mut [(R, usize
                 else                 { patch_bytes(output_file, out_pos, &(new_size as u32).to_be_bytes())?; }
             }
         } else if typ == fourcc("udta") && parent == fourcc("moov") && size >= header_size as u64 {
-            // mp4-trim's segment table (`moov/udta/MTRM`) maps the frames of the file it's in to the recordings they were cut from.
+            // The segment table (`moov/udta/MTRM`) maps the frames of the file it's in to the recordings they were cut from.
             // The merged file has the frames of all the files, on a timeline rebuilt here, so the first file's table would describe
             // frames it doesn't have: it's left out, and the rest of `udta` is written as it is
             let body = read_body(get_first(files), size - header_size as u64, typ, offs).map_err(|e| in_file(0, e))?;
@@ -419,7 +419,7 @@ fn elst_body(version: u8, flags: u32, edits: &[Edit]) -> Vec<u8> {
     b
 }
 
-/// The boxes of a `udta` payload without mp4-trim's segment table (`MTRM`), or `None` when it has none. What doesn't parse
+/// The boxes of a `udta` payload without the segment table (`MTRM`), or `None` when it has none. What doesn't parse
 /// as a box (QuickTime's 4 zero bytes at the end of `udta`, or anything after a box whose size doesn't fit) is kept as it is
 fn without_segment_table(udta: &[u8]) -> Option<Vec<u8>> {
     let mut kept = Vec::with_capacity(udta.len());

@@ -604,7 +604,7 @@ impl DecoderConfig {
 
 /// A `csgm` body (after its box header), in the one form known: Apple's compact sample-to-group mapping, which iPhone and
 /// Blackmagic Camera HEVC recordings carry for the `tscl` and `tsas` groupings of ISO/IEC 14496-15 (CoreMedia hands them
-/// to players as each frame's temporal level). Its syntax isn't published. mp4-trim established it on every `csgm` it has
+/// to players as each frame's temporal level). Its syntax isn't published. We established it on every `csgm` it has
 /// met (`IMG_6440.MOV`, `IMG_6441.MOV`, `A001_10161552_C016.mov`), against each picture's NAL header: version 0 and flags
 /// 0, `grouping_type`, a word of 0, 4 (the bits of each index), `pattern_count`, then each pattern's `pattern_length` and
 /// `sample_count` (32 bits each), then all the indices, 4 bits each, most significant first, zero bits padding the last

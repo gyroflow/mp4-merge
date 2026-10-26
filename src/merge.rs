@@ -765,8 +765,7 @@ impl Timeline<'_> {
     /// edit ends in as a whole, `mov_fix_index`, so the cut sample's rest would play over the next file's), and what is
     /// left to the next file's start, under a sample, is a gap like any other, which that sample fills. So the next file's
     /// sound starts exactly where its picture does, in every player. The samples after the cut are left out of the tables
-    /// (`head`), so the merged edit continues into the next file's, and FFmpeg reads PCM up to the cut, chunk by chunk, as
-    /// mp4-trim cuts PCM by its samples (its PLAN.md §6). A picture track is cut by its edit.
+    /// (`head`), so the merged edit continues into the next file's, and FFmpeg reads PCM up to the cut, chunk by chunk.
     ///
     /// A file's edit doesn't present past the file's own media, into the next file's: on its own, a file presents nothing
     /// there, so an edit runs past its media only as a placeholder: Canon's metadata edit of 1000 s, or an audio edit a
@@ -777,7 +776,7 @@ impl Timeline<'_> {
     /// (`mov_fix_index`). What the placeholder covered is then the gap after the file, or, after a chapter, nothing.
     ///
     /// A gap is never an empty edit in the middle of the track, which FFmpeg presents as the track's first samples (it
-    /// handles only leading ones). The media fills it, as mp4-trim's joined outputs and a muxer writing a timestamp gap do
+    /// handles only leading ones). The media fills it, as joined outputs and a muxer writing a timestamp gap do
     /// (`close_gap`):
     /// - the file's last sample lasts longer: its last in decoding order, when its edit presents its media to the end; the
     ///   one its edit ends in otherwise, which only a track without composition offsets can have lengthened (each later
@@ -1268,8 +1267,8 @@ fn pcm(tracks: &[&PartTrack], scaled: &[Vec<(u32, u32)>]) -> Pcm {
 }
 
 /// The bytes of a PCM frame, and the byte silence is, of the sound sample entry `e` (with its box header) of type `format`,
-/// in an `stsd` of version `stsd_version`. Read as FFmpeg reads them (`mov_parse_stsd_audio`, `mov_read_pcmc`), and
-/// mp4-trim: a frame is the channels times the sample size, which `in24`, `in32`, `fl32`, `fl64` and `raw ` fix, and the
+/// in an `stsd` of version `stsd_version`. Read as FFmpeg reads them (`mov_parse_stsd_audio`, `mov_read_pcmc`):
+//  a frame is the channels times the sample size, which `in24`, `in32`, `fl32`, `fl64` and `raw ` fix, and the
 /// `pcmC` box of ISO/IEC 23003-5's `ipcm` and `fpcm` gives. QuickTime's version 1 sound description (samplesPerPacket,
 /// bytesPerFrame) or version 2 one (constLPCMFramesPerAudioPacket, constBytesPerAudioPacket) must declare packets of one
 /// such frame; an ISO `stsd` of version 1 holds ISO's AudioSampleEntryV1 instead, whose channels a ChannelLayout box may
@@ -1542,7 +1541,7 @@ fn sample_groups(tracks: &[&PartTrack], silence: &[u32], name: &str) -> Result<(
 /// versions and without a description (§8.9.3.3: "or else with no group"). Version 2 has two layouts: the 2012 (Amd. 3)
 /// and 2015 editions put the index where version 1 has `default_length`, with entries that have no
 /// `description_length`; since the 2022 edition `default_length` is coded from version 1 on, and the index after it from
-/// version 2 on (version 3, from 2024, marks the grouping essential). As mp4-trim does, a box is read in the current
+/// version 2 on (version 3, from 2024, marks the grouping essential). A box is read in the current
 /// layout, or in the earlier one when only that one describes its bytes exactly, which takes the size of its entries:
 /// 2 bytes for `roll` and `prol` (§10.1), 1 for `sync` (ISO/IEC 14496-15 §8.4.4). `None` when neither reads it
 fn default_entry(description: Option<&Vec<u8>>) -> Option<u32> {
