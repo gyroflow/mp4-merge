@@ -12,6 +12,7 @@ mod output;
 mod progress_stream;
 mod writer;
 mod insta360;
+mod segment_table;
 use progress_stream::*;
 
 // We need to:
@@ -241,6 +242,7 @@ pub fn join_file_streams_with<F: Fn(f64), I: Read + Seek, O: Read + Write + Seek
         // The Insta360 metadata after the boxes isn't read as boxes
         if desc.parts.len() <= i { desc.parts.resize(i + 1, Default::default()); }
         desc.parts[i].end = boxes_end;
+        desc.parts[i].size = filesize as u64;
         desc_reader::read_desc(&mut fs, &mut desc, 0, boxes_end, i, 0)?;
         match desc.parts[i].moov {
             1 if desc.parts[i].tracks.is_empty() => return Err(Error::new(ErrorKind::InvalidData, format!("file {} has no tracks", i + 1))),

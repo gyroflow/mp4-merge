@@ -46,7 +46,9 @@ enum Kind {
 
 impl Destination {
     /// Checks that the output `path` isn't one of the `inputs` (open, with `names` their paths), that an existing file there
-    /// can be written to and replaced, and that a new one can be created there. Nothing is created or changed.
+    /// can be written to and replaced, and that a new one can be created there. Unless it's a device, it must be a file name,
+    /// and so must the file at the end of the symbolic links there. Where it's a new file, nothing may be at the file its
+    /// links lead to by their letters either, since the system reached nothing through them. Nothing is created or changed.
     pub fn check<P: AsRef<Path>>(path: &Path, names: &[P], inputs: &[(File, usize)]) -> Result<Self> {
         let error = |e: Error| Error::new(e.kind(), format!("checking the output {}: {e}", path.display()));
         let as_given = |kind| Self { path: path.to_owned(), target: path.to_owned(), kind, #[cfg(unix)] permissions: None };
@@ -57,6 +59,18 @@ impl Destination {
                 // Nothing there, or a symbolic link to where nothing is yet: the file is created where it points
                 let target = if is_link(path) { links_end(path).map_err(error)? } else { path.to_owned() };
                 check_new(path, &target)?;
+                // Nothing may be at `target`: the system, following the links there as `File::create` would, reached nothing,
+                // so this is a new file. Where the links lead by their letters to a file the system doesn't reach that way,
+                // `create` and the rename would make and replace it with none of the input-identity, write and replace checks
+                // the existing-file branch runs, and it could be an input. That is how a crafted drive-relative link (made by
+                // `FSCTL_SET_REPARSE_POINT`, not by any normal API, its substitute name a bare `F:out.mp4`) destroyed a file:
+                // the system resolves the relative reparse inside the link's own folder and finds nothing, while `read_link`
+                // gives `F:out.mp4` verbatim, which resolves against F:'s current directory to an existing file. The check is
+                // where the rename would act, so it is caught whatever the spelling. A healthy dangling link's end is absent,
+                // and a link the system follows normally leads where its letters do, so neither is refused; a no-op on Unix
+                if target != path && std::fs::symlink_metadata(&target).is_ok() {
+                    return Err(error(Error::new(ErrorKind::InvalidInput, format!("the symbolic link leads to {}, an existing file that the system doesn't reach through it", target.display()))));
+                }
                 return Ok(Self { target, ..as_given(Kind::New) });
             },
             Err(e) if is_device(path) => {
@@ -72,9 +86,15 @@ impl Destination {
             // A device or a pipe, never a file of the inputs. Not opened to identify it: opening a pipe waits for a writer
             return Ok(as_given(Kind::Device));
         }
+        // A file is there, but its path must be a file name, as a new output's: on Windows `out.mp4\.` names `out.mp4`, which
+        // Unix refuses, and `out.mp4:alt` a stream of a file or a folder, whose temporary file would be a stream of another
+        // file, which no rename can give the name
+        check_name(path, path)?;
         let output = File::open(path);
-        // The file replaced: the one at the end of the symbolic links there, which keep pointing to it
+        // The file replaced: the one at the end of the symbolic links there, which keep pointing to it. Its canonical path
+        // names a stream where a link points to one
         let target = if is_link(path) { linked_file(path, output.as_ref().ok()).map_err(error)? } else { path.to_owned() };
+        check_name(path, &target)?;
         // Where neither the identity nor the canonical paths tell, the output is refused, after what makes it fail anyway
         let mut unknown = None;
         for (input, name) in inputs.iter().zip(names) {
@@ -209,18 +229,29 @@ fn is_link(path: &Path) -> bool {
 }
 
 /// That `File::create` could create the output `path`, which is a new file at `target` (where a symbolic link there
-/// points): it is a file name, in a folder that exists
+/// points): both are file names, and it is in a folder that exists
 fn check_new(path: &Path, target: &Path) -> Result<()> {
-    let output = if target == path { format!("The output {}", path.display()) } else { format!("The output {}, a symbolic link to {},", path.display(), target.display()) };
-    if not_a_file_name(target) {
-        return Err(Error::new(ErrorKind::InvalidInput, format!("{output} isn't a file name")));
-    }
+    check_name(path, target)?;
+    let output = shown(path, target);
     let dir = folder(target);
     match std::fs::metadata(dir) {
         Ok(m) if m.is_dir() => Ok(()),
         Ok(_) => Err(Error::new(ErrorKind::NotADirectory, format!("{output} can't be created: {} isn't a directory", dir.display()))),
         Err(e) => Err(Error::new(e.kind(), format!("{output} can't be created in {}: {e}", dir.display())))
     }
+}
+
+/// That the output `path`, and `target`, the file that gets its name (where the symbolic links there lead), are file names
+fn check_name(path: &Path, target: &Path) -> Result<()> {
+    match [path, target].into_iter().find(|x| not_a_file_name(x)) {
+        Some(x) => Err(Error::new(ErrorKind::InvalidInput, format!("{} isn't a file name", shown(path, x)))),
+        None => Ok(())
+    }
+}
+
+/// The output `path` in messages, with `target` where the symbolic links there lead to another path
+fn shown(path: &Path, target: &Path) -> String {
+    if target == path { format!("The output {}", path.display()) } else { format!("The output {}, a symbolic link to {},", path.display(), target.display()) }
 }
 
 /// Whether `path` names no file: it ends with a separator, its last part is `.` or `..`, or on Windows its name holds a `:`.

@@ -124,6 +124,8 @@ pub struct PartDesc {
     pub end: u64,         // Where its boxes end
     pub walk_end: u64,    // Where they do as walked: the end of its last box. What follows isn't boxes
     pub moov: u32,        // How many moov boxes it has
+    pub size: u64,        // Its size in bytes
+    pub segment_tables: Option<Vec<Vec<u8>>>, // The payloads of the MTRM boxes of its first moov/udta (`segment_table`)
 }
 
 #[derive(Default, Clone, Debug)]
@@ -211,6 +213,10 @@ pub fn read_desc<R: Read + Seek>(d: &mut R, desc: &mut Desc, track: usize, max_r
             let body = |d: &mut R| read_body(d, body_size, typ, offs).map_err(|e| in_file(file_index, e));
             let fields = |e: Error| in_file(file_index, field_error(e, typ, offs));
             let part = &mut desc.parts[file_index];
+            if typ == fourcc("udta") && parent == fourcc("moov") && part.segment_tables.is_none() {
+                // A file cut from recordings has its segment table there
+                part.segment_tables = Some(crate::segment_table::payloads(&body(d)?));
+            }
             if typ == fourcc("mvhd") && parent == fourcc("moov") {
                 let body = body(d)?;
                 (part.mvhd_timescale, part.mvhd_duration) = header_fields(typ, &body).map_err(fields)?;

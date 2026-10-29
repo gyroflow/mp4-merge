@@ -17,6 +17,7 @@ use std::borrow::Cow;
 use std::io::{ Error, ErrorKind, Result };
 use crate::typ_to_str;
 use crate::{ fourcc, desc_reader::{ CompactToGroup, DecoderConfig, Desc, Edit, PartDesc, PartTrack, SampleToGroup, TrackDesc, MEDIA_RATE_1 } };
+use crate::segment_table::{ self, Table };
 
 fn refused(msg: String) -> Error { Error::new(ErrorKind::InvalidInput, format!("These files can't be merged: {msg}")) }
 fn invalid(msg: String) -> Error { Error::new(ErrorKind::InvalidData, msg) }
@@ -70,12 +71,15 @@ pub fn merge(desc: &mut Desc) -> Result<()> {
     };
     let mut filler = Filler { at: desc.mdat_offset, runs: Vec::new() };
     let mut tracks: Vec<Option<TrackDesc>> = vec![None; first.tracks.len()];
+    // The merged movie lasts at least as long as each track presents the files (`Plan::end`)
+    let mut presents = 0;
     // Where each file starts in the merged movie after another recording: where the first video track ends the previous
     // file's picture (so that track is merged first), or without one, where the previous file's tracks end
     let starts = match (0..tracks.len()).find(|&t| anchors(parts, t)) {
         Some(t) => {
-            let (track, starts) = merge_track(&movie, t, Role::Anchor, &mut filler)?;
+            let (track, starts, end) = merge_track(&movie, t, Role::Anchor, &mut filler)?;
             tracks[t] = Some(track);
+            presents = end;
             starts
         }
         None => {
@@ -90,17 +94,26 @@ pub fn merge(desc: &mut Desc) -> Result<()> {
     };
     for (t, track) in tracks.iter_mut().enumerate() {
         if track.is_none() {
-            *track = Some(merge_track(&movie, t, Role::Aligned(&starts), &mut filler)?.0);
+            let (merged, _, end) = merge_track(&movie, t, Role::Aligned(&starts), &mut filler)?;
+            *track = Some(merged);
+            presents = presents.max(end);
         }
     }
     let tracks: Vec<TrackDesc> = tracks.into_iter().flatten().collect();
-    // The merged movie: every file as long as its own tracks (`file_end`), and one followed by another recording up to where
-    // that one starts
+    // The merged movie: every file as long as its own tracks (`file_end`), and the files before another recording up to
+    // where that one starts, where each of their picture and sound tracks ends (`plan`), also after a chapter whose sound
+    // outlasts its picture. And as long as every track presents the files, as far as their own movies present them
+    // (ISO/IEC 14496-12 §8.2.2.3: its longest track's duration): after another recording, a sound track that starts a new
+    // edit does so on the tick nearest its picture, which can be after where the picture's edits end, and metadata follows
+    // the previous file's, which can end after its picture (`Plan::end`)
     let mut duration = 0;
     for (i, &end) in movie.ends.iter().enumerate() {
-        let separate = movie.continues.get(i).is_some_and(|&c| !c);
-        duration = add(duration, if separate { starts.ticks[i + 1].saturating_sub(starts.ticks[i]) } else { end })?;
+        duration = match movie.continues.get(i) {
+            Some(false) => starts.ticks[i + 1],
+            _ => add(duration, end)?
+        };
     }
+    let duration = duration.max(presents);
     desc.moov_mvhd_timescale = movie.timescale;
     desc.moov_mvhd_duration = duration;
     desc.moov_tracks = tracks;
@@ -134,29 +147,38 @@ struct Movie<'a> {
 fn file_end(p: &PartDesc, movie_timescale: u32) -> Result<u64> {
     let mut end = 0u64;
     for x in p.tracks.iter().filter(|x| !x.skip && x.stsz_count > 0) {
-        let media = u64::try_from(composition_end(x)?).unwrap_or(0);
-        if media == 0 { continue; }
-        let presented = match &x.elst {
-            None => rescale_up(media, x.mdhd_timescale, p.mvhd_timescale)?,
-            Some(edits) => edits.iter().try_fold(0u64, |sum, e| {
-                let presents = if e.media_time >= 0 && e.media_rate == MEDIA_RATE_1 {
-                    e.segment_duration.min(rescale_up(media.saturating_sub(e.media_time as u64), x.mdhd_timescale, p.mvhd_timescale)?)
-                } else {
-                    e.segment_duration
-                };
-                add(sum, presents)
-            })?
-        };
-        end = end.max(presented);
+        end = end.max(presented(&x.stts, x.ctts.as_ref(), x.elst.as_deref(), x.mdhd_timescale, p.mvhd_timescale)?);
     }
     rescale_up(end.min(p.mvhd_duration), p.mvhd_timescale, movie_timescale)
 }
 
+/// How long a track presents its samples, in its movie's timescale `movie_timescale`: its samples' durations (`stts`) and
+/// composition offsets (`ctts`), in `media_timescale`, through its edits (or as they are, without an edit list), each edit
+/// at the normal rate no further than the media (one that runs past it is a placeholder, see `Timeline::plan`). 0 for
+/// samples that last no time
+fn presented(stts: &[(u32, u32)], ctts: Option<&(u8, Vec<(u32, i32)>)>, elst: Option<&[Edit]>, media_timescale: u32, movie_timescale: u32) -> Result<u64> {
+    let media = u64::try_from(composition_end(stts, ctts)?).unwrap_or(0);
+    if media == 0 { return Ok(0); }
+    match elst {
+        None => rescale_up(media, media_timescale, movie_timescale),
+        Some(edits) => edits.iter().try_fold(0u64, |sum, e| {
+            let presents = if e.media_time >= 0 && e.media_rate == MEDIA_RATE_1 {
+                e.segment_duration.min(rescale_up(media.saturating_sub(e.media_time as u64), media_timescale, movie_timescale)?)
+            } else {
+                e.segment_duration
+            };
+            add(sum, presents)
+        })
+    }
+}
+
 /// Whether track `t` is the one whose picture tells where each file starts after another recording: the first video
-/// track whose samples last some time in a file (not one of thumbnails, as DJI's `nail`, nor timecode)
+/// track whose samples last some time in a file (not one of thumbnails, as DJI's `nail`, nor timecode). A track that is
+/// timecode in the first file is merged as timecode (`merge_track`), so it has no picture to start the files at
 fn anchors(parts: &[PartDesc], t: usize) -> bool {
     let picture = |x: &PartTrack| x.handler == fourcc("vide") && !x.skip && x.stts.iter().any(|e| e.0 > 0 && e.1 > 0);
-    parts.iter().any(|p| picture(&p.tracks[t])) && !(0..t).any(|u| parts.iter().any(|p| picture(&p.tracks[u])))
+    let anchor = |u: usize| !parts[0].tracks[u].skip && parts.iter().any(|p| picture(&p.tracks[u]));
+    anchor(t) && !(0..t).any(anchor)
 }
 
 /// For each file but the last, whether the next one continues its recording: whether it is the next chapter of a
@@ -194,17 +216,86 @@ fn anchors(parts: &[PartDesc], t: usize) -> bool {
 ///
 /// Neither moves the picture or the metadata, which follow the previous file's either way (`plan`). The first moves the
 /// sound of that last chapter to where its picture starts, by the few milliseconds the previous chapter's sound ended
-/// before or after its picture; the second keeps the previous file's sound running into the next one's, as up to 0.1.11
+/// before or after its picture; the second keeps the previous file's sound running into the next one's, as up to 0.1.11.
+///
+/// A file cut from camera recordings says which frames of which recordings it holds, in its segment table (`MTRM`,
+/// `segment_table`), and the cut started and ended each of its tracks with its picture, wherever its creation time says it
+/// was cut from. So the recordings decide, not the files' times:
+/// - a file that starts where the previous one ends in a recording (its first frame the one after the other's last)
+///   continues it: the cut split the recording's streams there, as a camera splits a chapter;
+/// - one that starts after its recording's first frame, or follows one that ends before its recording's last, starts
+///   another moment of it, or of another recording: every track starts anew with its picture;
+/// - otherwise the junction is between the recordings themselves: the last one of the previous file and the first one of
+///   the next, whose times (the table's sources') and durations are those of the camera's files, which the rule above
+///   takes as it takes the files. The same recording again is another moment of it
 fn junctions(parts: &[PartDesc]) -> Vec<bool> {
-    parts.windows(2).map(|w| {
-        let (a, b) = (&w[0], &w[1]);
-        let since = b.mvhd_creation as i128 - a.mvhd_creation as i128;
-        if since == 0 {
-            return !same_recording(a, b);
+    // Each file's segment table, where it's valid for the file
+    let tables: Vec<Option<Table>> = parts.iter().enumerate().map(|(i, p)| match Table::of_file(p.segment_tables.as_deref().unwrap_or_default(), p) {
+        Some(Ok(table)) => Some(table),
+        Some(Err(e)) => {
+            log::warn!("The segment table of file {} isn't valid for it, and is ignored: {e}", i + 1);
+            None
         }
-        // |since − a's duration| ≤ 2 s, in a's movie timescale
-        (since * a.mvhd_timescale as i128 - a.mvhd_duration as i128).abs() <= 2 * a.mvhd_timescale as i128
-    }).collect()
+        None => None,
+    }).collect();
+    parts.windows(2).zip(tables.windows(2)).map(|(p, t)| continues((&p[0], t[0].as_ref()), (&p[1], t[1].as_ref()))).collect()
+}
+
+/// A recording at one end of a file: the file itself, or a source of its segment table
+#[derive(Clone, Copy)]
+enum Recording<'a> {
+    File(&'a PartDesc),
+    Source(&'a segment_table::Source),
+}
+
+impl Recording<'_> {
+    /// Its creation time, seconds since 1904 (0 for none)
+    fn creation(&self) -> u64 {
+        match self { Self::File(p) => p.mvhd_creation, Self::Source(s) => s.creation }
+    }
+    /// Whether a recording that starts `since` seconds after this one does, by its creation time, starts within 2 s of
+    /// this one's end: of its movie's duration, or of its frames at its frame rate
+    fn ends_near(&self, since: i128) -> bool {
+        match self {
+            Self::File(p) => (since * p.mvhd_timescale as i128 - p.mvhd_duration as i128).abs() <= 2 * p.mvhd_timescale as i128,
+            Self::Source(s) => (since * s.fps.0 as i128 - s.frames as i128 * s.fps.1 as i128).abs() <= 2 * s.fps.0 as i128,
+        }
+    }
+    /// Whether it's the same recording as `other`: the same samples of two files, the same name and size of two sources,
+    /// and a file of a source's size and frames
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::File(a), Self::File(b)) => same_recording(a, b),
+            (Self::Source(a), Self::Source(b)) => a.name == b.name && a.size == b.size,
+            (Self::File(p), Self::Source(s)) | (Self::Source(s), Self::File(p)) => p.size == s.size && segment_table::presented_frames(p) == Some(s.frames),
+        }
+    }
+}
+
+/// Whether the file `b` continues the file `a`'s recording (`junctions`), each with its segment table
+fn continues(a: (&PartDesc, Option<&Table>), b: (&PartDesc, Option<&Table>)) -> bool {
+    if let (Some(ta), Some(tb)) = (a.1, b.1) {
+        let (last, first) = (ta.last(), tb.first());
+        let (sa, sb) = (ta.source_of(last), tb.source_of(first));
+        if sa.name == sb.name && sa.size == sb.size && last.src_first_frame + last.frame_count == first.src_first_frame {
+            return true;
+        }
+    }
+    // The recording each file ends or starts with, where it ends with its last frame or starts with its first
+    let end = match a.1 {
+        None => Some(Recording::File(a.0)),
+        Some(t) => { let s = t.last(); let src = t.source_of(s); (s.src_first_frame + s.frame_count == src.frames).then_some(Recording::Source(src)) }
+    };
+    let start = match b.1 {
+        None => Some(Recording::File(b.0)),
+        Some(t) => { let s = t.first(); (s.src_first_frame == 0).then_some(Recording::Source(t.source_of(s))) }
+    };
+    let (Some(end), Some(start)) = (end, start) else { return false };
+    let since = start.creation() as i128 - end.creation() as i128;
+    if since == 0 {
+        return !end.same(&start);
+    }
+    end.ends_near(since)
 }
 
 /// Whether two files hold the same recording: the same movie duration, and in every track the same samples
@@ -236,8 +327,8 @@ impl Filler {
 
 /// Merges track `t` of the files, in its `role` (`Role::Anchor` or `Role::Aligned`, which a track that isn't one of picture
 /// or sound plays as `Role::Continuous`). Also returns where its picture has each file start after another recording (the
-/// anchor's: `Plan::starts`)
-fn merge_track(movie: &Movie, t: usize, role: Role, filler: &mut Filler) -> Result<(TrackDesc, Starts)> {
+/// anchor's: `Plan::starts`), and how long it presents the files (`Plan::end`; 0 for timecode, which doesn't count)
+fn merge_track(movie: &Movie, t: usize, role: Role, filler: &mut Filler) -> Result<(TrackDesc, Starts, u64)> {
     let (parts, movie_timescale) = (movie.parts, movie.timescale);
     let tracks: Vec<&PartTrack> = parts.iter().map(|p| &p.tracks[t]).collect();
     let first = tracks[0];
@@ -248,7 +339,11 @@ fn merge_track(movie: &Movie, t: usize, role: Role, filler: &mut Filler) -> Resu
     }
 
     if first.skip {
-        // Timecode isn't merged: the track keeps the first file's samples, and spans all the files
+        // Timecode isn't merged: the track keeps the first file's samples, and spans all the files. So every file's must be
+        // timecode, or the merged track would leave out a later file's samples of another kind
+        if let Some(i) = tracks.iter().position(|x| !x.skip) {
+            return Err(refused(format!("{name} has another sample description in file {} than in file 1 ('{}' and '{}'): file 1's is timecode, of which the merged track keeps the first file's samples alone", i + 1, formats(tracks[i]), formats(first))));
+        }
         within_mdat(parts[0].mdat, first).map_err(|_| refused(format!("{name} of file 1 has samples outside its mdat box, and only that box is merged")))?;
         out.mdhd_timescale = first.mdhd_timescale;
         for x in &tracks {
@@ -275,7 +370,7 @@ fn merge_track(movie: &Movie, t: usize, role: Role, filler: &mut Filler) -> Resu
         out.stco = first.stco.clone();
         out.sdtp = first.sdtp.clone().unwrap_or_default();
         out.sample_groups = first.sbgp.clone();
-        return Ok((out, Starts { ticks: Vec::new(), exact: Vec::new(), timescale: 1 }));
+        return Ok((out, Starts { ticks: Vec::new(), exact: Vec::new(), timescale: 1 }, 0));
     }
 
     if first.encrypted {
@@ -348,7 +443,10 @@ fn merge_track(movie: &Movie, t: usize, role: Role, filler: &mut Filler) -> Resu
         }
         let gap = add(fill.lengthen.map_or(0, |l| l.1), fill.silence)?;
         media_offset = add(media_offset, gap)?;
-        out.mdhd_duration = add(out.mdhd_duration, add(rescale_up(x.mdhd_duration, ts, timescale)?, gap)?)?;
+        // Its media duration, less what `plan` shortened its last sample by, in the merged timescale, which holds that
+        // exactly, and with the gap after it
+        let media = rescale_up(x.mdhd_duration, ts, timescale)?.saturating_sub(plan.shortened[i]);
+        out.mdhd_duration = add(out.mdhd_duration, add(media, gap)?)?;
         if ctts_version.is_some() {
             let mut left = x.stsz_count;
             for &(count, offset) in x.ctts.iter().flat_map(|c| &c.1) {
@@ -421,7 +519,7 @@ fn merge_track(movie: &Movie, t: usize, role: Role, filler: &mut Filler) -> Resu
         out.insert_edts = first.elst.is_none();
         out.elst = Some(edits);
     }
-    Ok((out, Starts { ticks: plan.starts, exact: plan.exact, timescale }))
+    Ok((out, Starts { ticks: plan.starts, exact: plan.exact, timescale }, plan.end))
 }
 
 /// The sample descriptions of the merged track (`stsd`, after its header), when they aren't the first file's. The merged
@@ -431,7 +529,6 @@ fn merge_track(movie: &Movie, t: usize, role: Role, filler: &mut Filler) -> Resu
 /// samples as the file's own does, as long as no two files hold different parameter sets with the same id
 fn sample_descriptions(tracks: &[&PartTrack], name: &str) -> Result<Option<Vec<u8>>> {
     let first = tracks[0];
-    let formats = |x: &PartTrack| x.sample_entries.iter().map(|e| typ_to_str(e.format)).collect::<Vec<_>>().join(", ");
     let mut configs: Vec<Option<DecoderConfig>> = first.sample_entries.iter().map(|e| e.config.clone()).collect();
     for (i, x) in tracks.iter().enumerate().skip(1) {
         let differs = || refused(format!("{name} has another sample description in file {} than in file 1 ('{}' and '{}'): their codec configuration differs, and the merged track would decode every file's samples with the first file's", i + 1, formats(x), formats(first)));
@@ -498,6 +595,11 @@ fn sample_descriptions(tracks: &[&PartTrack], name: &str) -> Result<Option<Vec<u
         }
     }
     Ok(changed.then_some(stsd))
+}
+
+/// The formats of a file's track's sample entries, for messages
+fn formats(x: &PartTrack) -> String {
+    x.sample_entries.iter().map(|e| typ_to_str(e.format)).collect::<Vec<_>>().join(", ")
 }
 
 /// The media timescale of the merged track: the first file's, when it holds every file's timing (its sample durations,
@@ -609,14 +711,15 @@ fn media_duration(x: &PartTrack) -> Result<u64> {
     x.stts.iter().try_fold(0u64, |sum, e| add(sum, e.0 as u64 * e.1 as u64))
 }
 
-/// Where a file's media ends in its composition times (in its media ticks), which an edit's media times are in: the
-/// latest end of a sample's presentation, its decode time plus its composition offset and duration. Without `ctts`, the
-/// end of its decode times. A sample past a short `ctts` has the offset 0, as the merge gives it
-fn composition_end(x: &PartTrack) -> Result<i128> {
-    let Some((_, offsets)) = &x.ctts else { return Ok(media_duration(x)? as i128); };
+/// Where a track's media ends in its composition times (in its media ticks), which an edit's media times are in, from
+/// its samples' durations (`stts`) and composition offsets (`ctts`): the latest end of a sample's presentation, its decode
+/// time plus its composition offset and duration. Without `ctts`, the end of its decode times. A sample past a short
+/// `ctts` has the offset 0, as the merge gives it
+fn composition_end(stts: &[(u32, u32)], ctts: Option<&(u8, Vec<(u32, i32)>)>) -> Result<i128> {
+    let Some((_, offsets)) = ctts else { return Ok(stts.iter().try_fold(0u64, |sum, e| add(sum, e.0 as u64 * e.1 as u64))? as i128); };
     let mut offsets = offsets.iter().flat_map(|&(n, o)| std::iter::repeat_n(o as i128, n as usize));
     let (mut dts, mut end) = (0i128, 0i128);
-    for &(n, d) in &x.stts {
+    for &(n, d) in stts {
         for _ in 0..n {
             let o = offsets.next().unwrap_or(0);
             end = end.max(dts + o + d as i128);
@@ -633,8 +736,34 @@ struct Piece {
     media_time: i64, // In the merged media timescale, from where the file's media starts in it; -1 for an empty edit
     media_rate: i32,
     // At the normal rate, where it ends in the file's media: in its ticks times `.1`, and `.1`, the timescale of its
-    // duration (its precision)
+    // duration (its precision), or the media timescale where the merge ends it exactly (`Timeline::plan`)
     end: Option<(u128, u32)>,
+}
+
+impl Piece {
+    /// Whether it presents any of its file's media from `at` on (in ticks of the merged media timescale, from where the
+    /// file's media starts): an edit at the normal rate that ends after it, a dwell (rate 0) on a sample from there, or an
+    /// edit at another rate, whose media this doesn't follow
+    fn presents_after(&self, at: u128) -> bool {
+        match (self.media_time, self.end) {
+            (-1, _) => false,
+            (_, Some((end, den))) => end > at * den as u128,
+            (media_time, None) => self.media_rate != 0 || media_time as u128 >= at
+        }
+    }
+}
+
+/// Whether any of a file's edits `pieces` presents its media from `at` on (`Piece::presents_after`), as edits out of media
+/// order can: then its media from there may be neither dropped nor moved
+fn any_presents_after(pieces: &[Piece], at: u128) -> bool {
+    pieces.iter().any(|p| p.presents_after(at))
+}
+
+/// Whether an edit at the normal rate that ends at `end` (a `Piece::end`: in media ticks times `.1`, and `.1`) ends more
+/// than one unit after `point` (in media ticks times the movie timescale). Saturating: an edit that isn't cut to its
+/// media (`Timeline::plan`) can end near 2^97 there, and where one side saturates the answer still holds
+fn ends_past((end, den): (u128, u32), point: u128, movie_timescale: u32) -> bool {
+    end.saturating_mul(movie_timescale as u128) > point.saturating_add(1).saturating_mul(den as u128)
 }
 
 /// How the media fills the gap after a file: one of its samples (by its index in the file) lasts longer by so many ticks,
@@ -660,11 +789,25 @@ struct Plan {
     pieces: Vec<Vec<Piece>>, // What each file presents
     gaps: Vec<Gap>,          // Before each file
     fills: Vec<Fill>,        // After each file
+    // How much shorter each file's media is in the merged track than in the file, in ticks of the merged media timescale:
+    // by what its last sample lost where it lasts only up to the next recording (`Timeline::shorten`)
+    shortened: Vec<u64>,
     tkhd: u64,               // The track's duration, in the movie timescale
     // Where each file's presentation starts, before its leading empty edits: in the movie timescale, as the edits' durations
     // add up; and exactly, where the merged edits present it, in ticks of the movie timescale times the media timescale
     starts: Vec<u64>,
     exact: Vec<u128>,
+    // How long it presents the files, in the movie timescale: up to where it presents the end of each file's media, as
+    // far as the file's own movie presents it (`file_end`); in metadata, whose files follow each other's samples, after
+    // the previous files' media as far as theirs present it
+    end: u64,
+}
+
+impl Plan {
+    /// Whether an edit of file `j` other than its last presents its media from `at` on (`any_presents_after`)
+    fn others_present_after(&self, j: usize, at: u128) -> bool {
+        self.pieces[j].split_last().is_some_and(|(_, others)| any_presents_after(others, at))
+    }
 }
 
 /// How a track's files line up in the merged movie (`Timeline::plan`)
@@ -728,11 +871,39 @@ impl Arrival {
     }
 }
 
+/// How a file's edit ends where it runs past where the next recording starts in the track, or the file's media does
+/// (`Timeline::ending`)
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// Where the next file's sound continues this file's media: with a sample as the file's last (`Timeline::keeps_last`)
+    Last(Last),
+    /// At the start of its sample `kept`, where the file's media then ends (`end`, in ticks of the merged timescale from
+    /// the file's media start): the samples from there on are left out (`Timeline::sound_cut`)
+    Cut { kept: u32, end: u64 },
+    /// Up to the tick nearest the next file's picture, where it runs past it: keeping the sample that tick falls in
+    /// (`Timeline::keeps`), at `.0` in the file's media (in media ticks times the movie timescale, from the file's media
+    /// start), or where no sample decides it (an edit that isn't the file's last of media, a track that isn't sound or
+    /// whose samples have composition offsets or last no time, a point within the edit's first sample, or samples after
+    /// the cut that another edit of the file presents)
+    Tick(Option<u128>),
+}
+
+/// The sample of a file's sound that `Timeline::keeps_last` keeps as the file's last
+#[derive(Clone, Copy, Debug)]
+struct Last {
+    kept: u32,          // Its index in the file
+    ends: u64,          // Where it ends then, in ticks of the merged timescale from the file's media start
+    lasts: Option<u32>, // How long it lasts then, in those ticks, where it runs past the point: less than its own duration
+    at_point: bool,     // Whether it ends on the tick of the media nearest the point
+}
+
 /// A track of every file, as `merge_track` plans where the merged track presents each (`plan`, `close_gap`)
 struct Timeline<'a> {
     movie: &'a Movie<'a>,
     tracks: Vec<Cow<'a, PartTrack>>, // Each file's track; of a file whose sound `plan` cuts, the samples it keeps (`head`)
-    scaled: Vec<Vec<(u32, u32)>>,    // Their sample durations, in `timescale`
+    // Their sample durations, in `timescale`, as the merged track gives them: also of a sample `plan` shortens (`shorten`),
+    // which the file's track keeps as it is, with its media duration (`Plan::shortened`)
+    scaled: Vec<Vec<(u32, u32)>>,
     timescale: u32,                  // The merged track's media timescale
     role: Role<'a>,
     pcm: Pcm,
@@ -749,7 +920,8 @@ impl Timeline<'_> {
     /// - **After another recording,** the picture tells where a file starts. The first video track follows the previous
     ///   file's picture (`Role::Anchor`), so it presents every frame for as long as its file does, and the file starts
     ///   where that picture ends (`Plan::starts`; after a file without one, where that file's own tracks end,
-    ///   `Movie::ends`). Every other picture and sound track starts with its file there (`Role::Aligned`), so each file's
+    ///   `Movie::ends`). Every other picture and sound track starts with its file there (`Role::Aligned`): exactly where
+    ///   it continues the previous file's edit, and otherwise at the nearest tick of the movie timescale. So each file's
     ///   sound keeps its sync with its picture, as when the files play one after the other: a track that ends before the
     ///   next file starts is followed by a gap, and one that runs past it is cut there. Metadata follows the previous
     ///   file's (`Role::Continuous`), as the picture does: its readers time its samples by their durations and order, and
@@ -760,12 +932,32 @@ impl Timeline<'_> {
     /// - **A later file's leading empty edits** (a track that starts after its file does) are a gap before it too, but in
     ///   metadata, which its readers time by its samples alone: there they're left out.
     ///
-    /// Sound that runs past the start of the next file is cut there, at the start of its last sample that starts by then
-    /// (`sound_cut`): no sample is presented in part, which FFmpeg can't do at the end of an edit (it presents a sample an
-    /// edit ends in as a whole, `mov_fix_index`, so the cut sample's rest would play over the next file's), and what is
-    /// left to the next file's start, under a sample, is a gap like any other, which that sample fills. So the next file's
-    /// sound starts exactly where its picture does, in every player. The samples after the cut are left out of the tables
-    /// (`head`), so the merged edit continues into the next file's, and FFmpeg reads PCM up to the cut, chunk by chunk.
+    /// Sound that runs past where the next file's sound starts, also by less than a tick of the movie timescale, is cut
+    /// there, at the start of its last sample that starts by then (`sound_cut`): no sample is presented in part, which
+    /// FFmpeg can't do at the end of an edit (it presents a sample an edit ends in as a whole, `mov_fix_index`, so the cut
+    /// sample's rest would play over the next file's), and what is left to the next file's start, under a sample, is a gap
+    /// like any other, which that sample fills. So the next file's sound starts where its picture does, in every player:
+    /// exactly where it continues the cut sound's edit, and otherwise on the nearest tick of the movie timescale. The
+    /// samples after the cut are left out of the tables (`head`), so the merged edit continues into the next file's, and
+    /// FFmpeg reads PCM up to the cut, chunk by chunk. The file's edits after the one that runs past that point come after
+    /// the next file's start: they are left out, also where the cut ends that one before the point (an empty one would be
+    /// an empty edit in the middle of the track, below). Coded sound keeps the sample the next file's start falls in where
+    /// the cut would take more of the file's own sound within its picture than keeping it plays over the next file's
+    /// (`ending`):
+    /// - where the next file's sound continues this file's last edit of media (its first edit of media, after any leading
+    ///   empty ones, presents its media from the start, and no edit of this file comes between: that edit is the file's
+    ///   last, or it runs past the point), the kept sample is the file's last, lasting only up to where the next file's
+    ///   picture starts, to the nearest tick of the media, and the next file's sound continues the edit there
+    ///   (`keeps_last`). Where the file's edit ends before that point and hides its media after it, the sample kept or cut
+    ///   is the one its presentation ends in, and the file's later media is left out. So the next file's sound starts
+    ///   where it belongs at every junction, not later at each, and the merged sound is one edit, which a stream copy keeps
+    ///   as it is (FFmpeg starts each later edit of sound with up to a second of the media before it, which it presents as
+    ///   discarded, and a stream copy as sound);
+    /// - otherwise, its edit is cut on the tick nearest the next file's picture, where the next file's sound starts, in
+    ///   its own edit (`keeps`).
+    ///
+    /// A file with another edit that presents some of those samples (edits out of media order, as in a reference movie)
+    /// keeps them all, and its edit is cut where the next file starts.
     ///
     /// A file's edit doesn't present past the file's own media, into the next file's: on its own, a file presents nothing
     /// there, so an edit runs past its media only as a placeholder: Canon's metadata edit of 1000 s, or an audio edit a
@@ -780,23 +972,29 @@ impl Timeline<'_> {
     /// (`close_gap`):
     /// - the file's last sample lasts longer: its last in decoding order, when its edit presents its media to the end; the
     ///   one its edit ends in otherwise, which only a track without composition offsets can have lengthened (each later
-    ///   sample moves with it);
+    ///   sample moves with it, so none may be one that another edit of the file presents);
     /// - in PCM, silence follows the file's samples, in a chunk of its own (`Pcm`);
     /// - before the track's first media, it is an empty edit, as a file's own leading one.
     ///
     /// The edit that presents the file's media to the end then presents the fill too, and continues into the next file's.
     /// Also gives the track's duration (`tkhd`, the sum of its edits, §8.3.2.3): every file's own, but for a file whose edits
-    /// were cut, the smaller of its own and its edits now (Canon's metadata track lasts 22 s, its edit 1000 s), and with the
-    /// gaps
+    /// were cut, the smaller of its own and its edits now (Canon's metadata track lasts 22 s, its edit 1000 s), with what the
+    /// merge made its last edit present longer than the file's own (the sample it keeps as its last, `keeps_last`), and
+    /// with the gaps
     fn plan(&mut self) -> Result<Plan> {
         let movie = self.movie;
         let (parts, movie_timescale, timescale, n) = (movie.parts, movie.timescale, self.timescale, movie.parts.len());
         let durations = self.scaled.iter().map(|s| s.iter().try_fold(0u64, |sum, e| add(sum, e.0 as u64 * e.1 as u64))).collect::<Result<Vec<_>>>()?;
-        let mut plan = Plan { pieces: Vec::with_capacity(n), gaps: vec![Gap::None; n], fills: vec![Fill::default(); n], tkhd: 0, starts: vec![0; n], exact: vec![0; n] };
+        let mut plan = Plan { pieces: Vec::with_capacity(n), gaps: vec![Gap::None; n], fills: vec![Fill::default(); n], shortened: vec![0; n], tkhd: 0, starts: vec![0; n], exact: vec![0; n], end: 0 };
         let mut at = Arrival::default();
         let mut presented = false; // The previous file presents media
         // One of `starts` in this track's ticks of the movie timescale times its media timescale
         let target = |starts: &Starts, i: usize| starts.exact.get(i).and_then(|e| e.checked_mul(timescale as u128)).map(|e| (e + starts.timescale as u128 / 2) / starts.timescale as u128);
+        // And to the nearest tick of the movie timescale: where a file whose track doesn't continue the previous file's edit
+        // starts, and the previous file's presentation ends. `Starts::ticks` add up the picture's edits, each rounded up to
+        // the movie timescale, while its frames follow each other exactly, so a file started there would be late by the
+        // rounding of every edit before it
+        let nearest = |starts: &Starts, i: usize| target(starts, i).and_then(|t| u64::try_from((t + timescale as u128 / 2) / timescale as u128).ok()).unwrap_or(starts.ticks[i]);
         for (i, p) in parts.iter().enumerate() {
             let x = &self.tracks[i];
             let (file_edits, edit_timescale) = match &x.elst {
@@ -814,7 +1012,7 @@ impl Timeline<'_> {
                 // recording, where the file starts
                 let start = match self.role {
                     Role::Anchor if separate && !presented => at.pos.max(add(plan.starts[i - 1], movie.ends[i - 1])?),
-                    Role::Aligned(starts) if separate => starts.ticks[i].max(at.pos),
+                    Role::Aligned(starts) if separate => nearest(starts, i).max(at.pos),
                     _ => at.pos
                 };
                 // Exactly: where the merged edits present the start of the file's media when it follows the previous file's
@@ -843,27 +1041,47 @@ impl Timeline<'_> {
                 plan.tkhd = add(plan.tkhd, length)?;
             }
             let x = &self.tracks[i];
+            // Where the track presents the file from, after the gap before it
+            let shown_from = at.pos;
             // When a file follows: where its first edit starts in the media, from where this file's starts, if this file's
             // last can continue into it (it presents media at the normal rate), and where this file's media ends in its
-            // composition times
+            // composition times. Its first edit, not its first of media (`next_from_start`): after a leading empty edit, a
+            // gap that `close_gap` fills, this file's edit doesn't run on into the next file's media, so one that runs past
+            // its own media is a placeholder
             let next = self.tracks.get(i + 1).map(|y| match y.elst.as_deref() {
                 None => Some(durations[i]),
                 Some(e) => e.first().filter(|e| e.media_time >= 0 && e.media_rate == MEDIA_RATE_1)
                     .and_then(|e| rescale_exact(e.media_time as u64, y.mdhd_timescale, timescale)).and_then(|m| m.checked_add(durations[i]))
             });
             let own_end = match next {
-                Some(_) => u64::try_from(composition_end(x)?).ok().and_then(|c| rescale_exact(c, x.mdhd_timescale, timescale)),
+                Some(_) => u64::try_from(composition_end(&x.stts, x.ctts.as_ref())?).ok().and_then(|c| rescale_exact(c, x.mdhd_timescale, timescale)),
                 None => None
             };
-            // Before another recording: what's left of the file's own presentation, which ends where the next file starts,
-            // and where that is exactly
+            // The next file has no edit list, or its first edit of media (after its leading empty edits, a gap before it)
+            // presents its media from the start at the normal rate: its media follows this file's in the merged media, so
+            // its sound can continue this file's edit
+            let next_from_start = self.tracks.get(i + 1).is_some_and(|y| y.elst.as_deref().is_none_or(|e| {
+                e.iter().find(|e| e.media_time != -1).is_some_and(|e| e.media_time == 0 && e.media_rate == MEDIA_RATE_1)
+            }));
+            // Before another recording: what's left of the file's own presentation, which ends where the next file starts;
+            // and in ticks of the movie timescale times the media timescale, where the next file's picture starts (where
+            // this file's ends), the tick of the movie timescale nearest it, and where this file's sound ends: exactly
+            // where that picture starts, when the next file's sound continues this file's edit (its media ends there,
+            // `keeps_last`), and otherwise on that tick, where the next file's own edit starts
             let (mut room, next_start) = match self.role {
-                Role::Aligned(starts) if i + 1 < n && !movie.continues[i] => (Some(starts.ticks[i + 1].saturating_sub(at.pos)), target(starts, i + 1)),
+                Role::Aligned(starts) if i + 1 < n && !movie.continues[i] => {
+                    let tick = nearest(starts, i + 1);
+                    let picture = target(starts, i + 1);
+                    let sound = if next_from_start { picture } else { Some(tick as u128 * timescale as u128) };
+                    (Some(tick.saturating_sub(at.pos)), Some((picture, tick as u128 * timescale as u128, sound)))
+                }
                 _ => (None, None)
             };
             let last = file_edits.iter().rposition(|e| e.media_time != -1);
             let (mut pieces, mut changed, mut length) = (Vec::new(), lead > 0, 0u64);
-            let (mut cut, mut has_media) = (None, false);
+            // The samples the file keeps (`truncate`), how long its last one then lasts where that is less than its own
+            // (`shorten`), and how much longer than the file's own its last edit then is (`keeps_last`)
+            let (mut cut, mut lasts, mut grown, mut has_media) = (None, None, 0u64, false);
             for (k, e) in file_edits.iter().enumerate().skip(lead) {
                 let duration = rescale_up(e.segment_duration, edit_timescale, movie_timescale)?;
                 let mut piece = Piece { duration, media_time: -1, media_rate: e.media_rate, end: None };
@@ -893,29 +1111,87 @@ impl Timeline<'_> {
                     piece.end = (e.media_rate == MEDIA_RATE_1).then_some((edit_end, edit_timescale));
                 }
                 if let Some(room) = room.as_mut() {
-                    if piece.duration > *room {
-                        // Past the file's own presentation, into the next file's: where that starts, in media ticks times the
-                        // movie timescale from the file's media start
-                        changed = true;
-                        let point = piece.media_time as u128 * movie_timescale as u128 + next_start.map_or(*room as u128 * timescale as u128, |s| s.saturating_sub(shown_at));
-                        match if Some(k) == last { self.sound_cut(i, &piece, point) } else { None } {
-                            Some((kept, end)) => {
+                    // In media ticks times the movie timescale, from the file's media start: where the merged edits present
+                    // a point of the presentation (in ticks of the movie timescale times the media timescale) in this edit
+                    let media = u128::try_from(piece.media_time).ok().map(|m| m * movie_timescale as u128);
+                    let within = |at: u128| media.and_then(|m| m.checked_add(at.saturating_sub(shown_at)));
+                    // Where the next file's sound starts, for the file's last edit of media
+                    let point = match next_start {
+                        Some((_, _, sound)) if Some(k) == last => sound.map_or(media.and_then(|m| m.checked_add(*room as u128 * timescale as u128)), within),
+                        _ => None
+                    };
+                    // Whether that edit presents media past it exactly, by more than the point's precision (a tick of the
+                    // movie timescale times the media timescale): its duration in the movie timescale doesn't tell when
+                    // it is by less than a tick
+                    let ends_after = match (point, piece.end) {
+                        (Some(point), Some(end)) => ends_past(end, point, movie_timescale),
+                        _ => false
+                    };
+                    // Whether the next file's sound continues that edit: its media follows this file's, and no edit of the
+                    // file comes between (it is the file's last edit, or it runs past the point: the file's later edits
+                    // then come after the next file's start, and get no room, below). And then, whether the file's media
+                    // runs past the point by more than half a tick of the media, also where the edit hides it: the next
+                    // file's sound would start that much late, and later at every such junction
+                    let next_continues = next_from_start && point.is_some() && piece.end.is_some() && (k + 1 == file_edits.len() || ends_after);
+                    let past = ends_after || (next_continues && point.zip(own_end).is_some_and(|(point, m)| {
+                        (m as u128).saturating_mul(movie_timescale as u128) > point.saturating_add(movie_timescale as u128 / 2)
+                    }));
+                    if piece.duration > *room || past {
+                        // Past the file's own presentation, into the next file's: it ends there (`ending`), the last edit of
+                        // media of sound at a sample boundary, whose later samples are left out (`head`)
+                        let on_tick = next_start.and_then(|(picture, tick, _)| within(tick).zip(picture.and_then(within)));
+                        let before = piece.duration;
+                        match self.ending(i, &piece, &pieces, point, next_continues, on_tick) {
+                            Ending::Last(Last { kept, ends, lasts: shorter, at_point }) => {
+                                log::debug!("{}: the sound of file {} keeps its sample {kept}, which its presentation ends in, as its last", self.name, i + 1);
+                                changed = true;
+                                // Its samples after it are left out, and it lasts up to the point, when it runs past it: the
+                                // next file's media, which follows this file's, then starts there, in the same edit
+                                if kept + 1 < x.stsz_count { cut = Some(kept + 1); }
+                                lasts = shorter;
+                                // Up to the tick nearest the next file's picture when it ends at the point, and otherwise
+                                // rounded down, and the gap to the next file is filled. Where the file's edit ends before the
+                                // point, in that sample, the edit then presents more than the file's own, and the track's
+                                // duration has that too
+                                piece.duration = if at_point {
+                                    *room
+                                } else {
+                                    u64::try_from((ends as u128 - piece.media_time as u128) * movie_timescale as u128 / timescale as u128).unwrap_or(u64::MAX)
+                                };
+                                piece.end = Some((ends as u128 * timescale as u128, timescale));
+                                grown = piece.duration.saturating_sub(before);
+                            }
+                            Ending::Cut { kept, end } => {
                                 log::debug!("{}: the sound of file {} is cut at its sample {kept}, where the next file starts", self.name, i + 1);
+                                changed = true;
                                 // Rounded down: the gap to the next file is filled
                                 piece.duration = u64::try_from((end as u128 - piece.media_time as u128) * movie_timescale as u128 / timescale as u128).unwrap_or(u64::MAX);
                                 piece.end = Some((end as u128 * movie_timescale as u128, movie_timescale));
                                 if kept < x.stsz_count { cut = Some(kept); }
                             }
-                            None => {
-                                log::debug!("{}: an edit of file {} presents {} ticks past the file's end; cut there", self.name, i + 1, piece.duration - *room);
-                                piece.duration = *room;
-                                if piece.end.is_some() {
-                                    piece.end = Some((piece.media_time as u128 * movie_timescale as u128 + *room as u128 * timescale as u128, movie_timescale));
+                            Ending::Tick(tick) if piece.duration > *room => {
+                                match tick {
+                                    Some(_) => log::debug!("{}: the sound of file {} keeps its sample the next file starts in, and its edit is cut there", self.name, i + 1),
+                                    None => log::debug!("{}: an edit of file {} presents {} ticks past the file's end; cut there", self.name, i + 1, piece.duration - *room)
                                 }
+                                changed = true;
+                                piece.duration = *room;
+                                // Exactly, in ticks of the media timescale, when it keeps its sample: the next file's sound,
+                                // whose media follows this file's, starts a new edit on the tick, however near this file's
+                                // media ends after it
+                                let exact = tick.and_then(|at| at.checked_mul(timescale as u128)).map(|at| ((at + movie_timescale as u128 / 2) / movie_timescale as u128, timescale));
+                                piece.end = piece.end.and(exact.or(media.map(|m| (m + *room as u128 * timescale as u128, movie_timescale))));
+                            }
+                            // Past it by less than a tick of the movie timescale, and no sample boundary takes that off, or it
+                            // keeps its sample, and ends by the tick: it stays
+                            Ending::Tick(tick) => if tick.is_some() {
+                                log::debug!("{}: the sound of file {} keeps its sample the next file starts in", self.name, i + 1);
                             }
                         }
                     }
-                    *room = room.saturating_sub(piece.duration);
+                    // What's left for the file's later edits: nothing once its last edit of media runs past the point, also
+                    // where the edit was cut before it, as they come after the next file's start then
+                    *room = if ends_after { 0 } else { room.saturating_sub(piece.duration) };
                 }
                 if piece.duration == 0 && duration > 0 { continue; } // It presents only media after the file's, or after the file's end
                 length = add(length, piece.duration)?;
@@ -927,13 +1203,20 @@ impl Timeline<'_> {
                 pieces.push(piece);
             }
             at.pos = add(at.pos, length)?;
+            // How far the track presents the file, which its own movie presents up to its end (`Movie::ends`), from where
+            // it presents its media: in picture and sound, where the merged edits do; in metadata, which leaves out a gap
+            // and follows the previous file's samples, after what the track presents of the previous files
+            let from = if matches!(self.role, Role::Continuous) { plan.end } else { shown_from };
+            plan.end = plan.end.max(add(from, length.min(movie.ends[i].saturating_sub(lead_duration)))?);
             // Its own duration of the track (without the leading empty edits that are now a gap), or for a file whose edits
-            // changed, the smaller of that and what they present now
+            // changed, the smaller of that and what they present now within the file's own, with what its last edit now
+            // presents past its own end
             let own = rescale_up(x.tkhd_duration, p.mvhd_timescale, movie_timescale)?.saturating_sub(lead_duration);
-            plan.tkhd = add(plan.tkhd, if changed && i + 1 < n { own.min(length) } else { own })?;
+            plan.tkhd = add(plan.tkhd, if changed && i + 1 < n { add(own.min(length.saturating_sub(grown)), grown)? } else { own })?;
             plan.pieces.push(pieces);
             presented = has_media;
             if let Some(kept) = cut { self.truncate(i, kept); }
+            if let Some(duration) = lasts { plan.shortened[i] = self.shorten(i, duration); }
             at.offset += self.scaled[i].iter().map(|e| e.0 as u128 * e.1 as u128).sum::<u128>();
         }
         Ok(plan)
@@ -947,7 +1230,8 @@ impl Timeline<'_> {
     /// a tick of the movie timescale. In metadata a gap is left out by design (`plan`); in picture and sound, where the
     /// media can't fill it, with a warning:
     /// - after an edit at another rate;
-    /// - after an edit that ends before its media does, in a track with composition offsets;
+    /// - after an edit that ends before its media does, in a track with composition offsets, or when another edit of the
+    ///   file presents the media after it (edits out of media order), which the fill would move or take the place of;
     /// - in a sound track whose samples each last one tick that isn't PCM the merge knows the silence of (`Pcm`);
     /// - when the sample made longer wouldn't fit its 32-bit duration (13 hours at 90 kHz), or the track's samples or chunks
     ///   with the silence wouldn't number in 32 bits.
@@ -998,8 +1282,13 @@ impl Timeline<'_> {
         }
         if matches!(self.pcm, Pcm::Silence { .. }) {
             if !to_the_end {
-                // The samples the edit doesn't present are left out, from the one nearest where it ends (each lasts a tick)
+                // The samples the edit doesn't present are left out, from the one nearest where it ends (each lasts a
+                // tick), so the silence follows those it presents: only when no other edit of the file presents them, as
+                // edits out of media order can, which would then present the silence and the next file's samples
                 let kept = u32::try_from((end + den as u128 / 2) / den as u128).unwrap_or(u32::MAX).min(self.tracks[j].stsz_count);
+                if plan.others_present_after(j, kept as u128) {
+                    return left_out(&format!("another edit of file {} presents its samples after where its last edit ends, which silence can't follow then", j + 1));
+                }
                 log::debug!("{name}: file {} presents its PCM up to sample {kept}, so its samples after that are left out and the silence follows", j + 1);
                 let before = self.scaled[j].iter().map(|e| e.0 as u128 * e.1 as u128).sum::<u128>();
                 self.truncate(j, kept);
@@ -1021,17 +1310,24 @@ impl Timeline<'_> {
             let sample = if to_the_end {
                 self.tracks[j].stsz_count - 1
             } else if self.tracks[j].ctts.is_none() {
-                // The last sample that starts before the edit ends
+                // The last sample that starts before the edit ends, and where it ends. Every later sample moves with it, so
+                // no other edit of the file may present one, as edits out of media order can
                 let (mut dts, mut first, mut found) = (0u128, 0u32, None);
                 for &(count, delta) in &self.scaled[j] {
                     if count > 0 && dts * (den as u128) < end {
                         let k = if delta == 0 { count - 1 } else { u32::try_from((end - dts * den as u128 - 1) / (delta as u128 * den as u128)).unwrap_or(u32::MAX).min(count - 1) };
-                        found = Some(first + k);
+                        found = Some((first + k, dts + (k as u128 + 1) * delta as u128));
                     }
                     dts += count as u128 * delta as u128;
                     first += count;
                 }
-                match found { Some(s) => s, None => return left_out("its edit ends before the file's first sample") }
+                match found {
+                    None => return left_out("its edit ends before the file's first sample"),
+                    Some((_, ends)) if plan.others_present_after(j, ends) => {
+                        return left_out(&format!("another edit of file {} presents its samples after the one that would last longer, which would move them", j + 1));
+                    }
+                    Some((s, _)) => s
+                }
             } else {
                 return left_out("its edit hides the end of a track with composition offsets");
             };
@@ -1042,8 +1338,7 @@ impl Timeline<'_> {
                 Some(_) => return left_out("another sample of the file presents a gap already")
             };
             // Its duration then: 32 bits hold 13 hours at 90 kHz
-            let delta = self.scaled[j].iter().scan(0u32, |first, &(count, delta)| { let at = *first; *first = first.saturating_add(count); Some((at, count, delta)) })
-                .find(|&(at, count, _)| (at..at.saturating_add(count)).contains(&sample)).map_or(0, |e| e.2);
+            let delta = self.duration_of(j, sample);
             if (delta as u64).saturating_add(longer) > u32::MAX as u64 {
                 return left_out("it doesn't fit a sample's 32-bit duration");
             }
@@ -1055,10 +1350,41 @@ impl Timeline<'_> {
         Ok((Gap::Fill(length, ticks), length))
     }
 
-    /// Where file `j`'s media ends in its composition times, in ticks of the merged media timescale
+    /// Where file `j`'s media ends in its composition times, in ticks of the merged media timescale: without composition
+    /// offsets, where its samples end as the merged track times them (`scaled`, with a sample `plan` shortened)
     fn media_end(&self, j: usize) -> Result<u64> {
         let x = &self.tracks[j];
-        Ok(u64::try_from(composition_end(x)?).ok().and_then(|c| rescale_exact(c, x.mdhd_timescale, self.timescale)).unwrap_or(u64::MAX))
+        if x.ctts.is_none() {
+            return Ok(u64::try_from(self.scaled[j].iter().map(|e| e.0 as u128 * e.1 as u128).sum::<u128>()).unwrap_or(u64::MAX));
+        }
+        Ok(u64::try_from(composition_end(&x.stts, x.ctts.as_ref())?).ok().and_then(|c| rescale_exact(c, x.mdhd_timescale, self.timescale)).unwrap_or(u64::MAX))
+    }
+
+    /// How file `i`'s edit `piece`, after its edits `pieces`, ends where it runs past where the next recording starts in the
+    /// track, or the file's media does (`plan`): for its last edit of media, where the next file's sound starts, `point`
+    /// (in media ticks times the movie timescale, from the file's media start). Sound is cut at the start of a sample
+    /// (`sound_cut`): the one the point falls in, or where the next file's sound continues this file's media
+    /// (`next_continues`), the one the file's presentation ends in, at the point or where the edit ends before it. Coded
+    /// sound keeps that sample instead where that leaves out less of the file's own sound: as the file's last, where the
+    /// next file's sound continues its media (`keeps_last`), and otherwise with the edit cut on the tick nearest the next
+    /// file's picture (`keeps`), which `on_tick` gives with where that picture starts, in the file's media. The samples
+    /// left out must be none that another edit of the file presents, as edits out of media order can
+    fn ending(&self, i: usize, piece: &Piece, pieces: &[Piece], point: Option<u128>, next_continues: bool, on_tick: Option<(u128, u128)>) -> Ending {
+        let Some(point) = point else { return Ending::Tick(None); };
+        let by = match piece.end {
+            Some((end, den)) if next_continues => point.min(end.saturating_mul(self.movie.timescale as u128) / den as u128),
+            _ => point
+        };
+        let Some(cut @ (kept, end)) = self.sound_cut(i, piece, by).filter(|&(_, end)| !any_presents_after(pieces, end as u128)) else {
+            return Ending::Tick(None);
+        };
+        if next_continues {
+            return self.keeps_last(i, piece, cut, point).map_or(Ending::Cut { kept, end }, Ending::Last);
+        }
+        match on_tick {
+            Some((tick, picture)) if self.keeps(i, piece, cut, point, tick, picture) => Ending::Tick(Some(tick)),
+            _ => Ending::Cut { kept, end }
+        }
     }
 
     /// Where file `i`'s sound is cut when the next recording starts at `point` in its last edit, `piece` (in media ticks
@@ -1086,6 +1412,87 @@ impl Timeline<'_> {
             s += count;
         }
         cut
+    }
+
+    /// Whether file `i`'s sound keeps the sample the next recording's sound start `point` falls in, rather than being cut
+    /// at its start (`sound_cut`: the samples before it, and where it starts), where its last edit `piece` presents past
+    /// the point and the next file's sound starts its own edit. Coded sound keeps it when, kept, it plays no more of the
+    /// file's own sound over the next file's than the cut would leave out within the file's picture, which ends at
+    /// `picture`. Kept, the edit is cut on the tick nearest the next file's picture (`tick`), where the next file's sound
+    /// then starts, so it must still present some of the sample there. All in media ticks times the movie timescale, from
+    /// the file's media start.
+    ///
+    /// The cut leaves out the sample's sound from its start, the end of the file's own sound within its picture (up to an
+    /// AAC frame: 21 ms at 48 kHz), and the sample before it lasts longer: a gap in every player. Kept, the sample is
+    /// presented up to the tick by a player that cuts a sample at the end of an edit (GStreamer's qtdemux), while FFmpeg
+    /// presents it whole (`mov_fix_index`), as do players that don't: what the edit presents of it past the tick plays
+    /// over the next file's start, and so does the rest the file's own edit hides, as FFmpeg plays it at the end of the
+    /// file on its own. FFmpeg's concat demuxer keeps every packet that starts before its out point likewise. So the cut
+    /// is made only where the file's own sound it keeps from playing over the next file's is more than the sound it takes
+    /// from within the file's picture: the smaller loss either way, and never more than half the sample of the file's own
+    /// sound. Where the file's sound runs on past its picture, the samples wholly after the tick are left out of the
+    /// presentation either way. PCM, whose samples each last a tick, is always cut at a sample, exactly, and loses nothing
+    /// it presents within its picture. Where the next file's sound continues this file's media, `keeps_last` decides
+    fn keeps(&self, i: usize, piece: &Piece, (kept, start): (u32, u64), point: u128, tick: u128, picture: u128) -> bool {
+        let (Pcm::No, Some((end, den))) = (&self.pcm, piece.end) else { return false; };
+        let movie = self.movie.timescale as u128;
+        let (from, to) = (start as u128 * movie, (start as u128 + self.duration_of(i, kept) as u128) * movie);
+        // Where the edit ends; what the kept sample plays of the file's own sound past the tick, and what the cut would
+        // leave out of it before the next file's picture
+        let end = end.saturating_mul(movie) / den as u128;
+        let (over, lost) = (end.min(to).saturating_sub(tick), end.min(picture).saturating_sub(from));
+        from < point && point < to && from < tick && over <= lost
+    }
+
+    /// Where the next recording's sound continues file `i`'s media, which runs past where that sound starts, `point`:
+    /// whether file `i`'s sound keeps the sample its presentation ends in there, at the point or where its last edit
+    /// `piece` ends before it, rather than being cut at its start (`sound_cut`: the samples before it, and where it starts),
+    /// and then where it ends (`Last`). The point is in media ticks times the movie timescale, from the file's media start.
+    ///
+    /// Coded sound keeps it when the file presents some of it before the point, and, kept, it plays no more of the file's
+    /// own sound past the point than the cut would leave out (as `keeps`). Kept, it is the file's last sample (its later
+    /// ones, which the edit hides or which run past the point, are left out), and where it runs past the point it lasts
+    /// only up to it, to the nearest tick, so the next file's media, which follows it, starts where the next file's sound
+    /// belongs, in the same edit: at every such junction, and not late by what this file's edit hid of its media. FFmpeg
+    /// writes a stream cut within a frame so (its concat demuxer and `mov_write_stts_tag`: the frame kept whole, lasting
+    /// up to the next one). Players present the whole frame, its rest over the next file's start, as FFmpeg presents a
+    /// frame an edit ends in (`mov_fix_index`), and the merged file has no edit there that FFmpeg would start with a second
+    /// of the media before it, which a stream copy keeps as sound. PCM, whose samples each last a tick, is always cut at a
+    /// sample, exactly
+    fn keeps_last(&self, i: usize, piece: &Piece, (kept, start): (u32, u64), point: u128) -> Option<Last> {
+        let (Pcm::No, Some((end, den))) = (&self.pcm, piece.end) else { return None; };
+        let movie = self.movie.timescale as u128;
+        let to = start.checked_add(self.duration_of(i, kept) as u64)?;
+        let (from, end) = (start as u128 * movie, end.saturating_mul(movie) / den as u128);
+        // What the kept sample plays of the file's own sound past the point, and what the cut would leave out before it
+        let (over, lost) = (end.min(to as u128 * movie).saturating_sub(point), end.min(point).saturating_sub(from));
+        // Where it ends: at the point, to the nearest tick, when it runs past it. It ends at the point when it ends on that
+        // tick, as also one does that ends less than half a tick before the point
+        let nearest = (point + movie / 2) / movie;
+        let ends = if to as u128 * movie > point { u64::try_from(nearest).ok()? } else { to };
+        (lost > 0 && over <= lost && ends > start).then(|| Last { kept, ends, lasts: (ends < to).then(|| (ends - start) as u32), at_point: ends as u128 == nearest })
+    }
+
+    /// The duration of file `i`'s sample `s` in the merged timescale (0 past its last)
+    fn duration_of(&self, i: usize, s: u32) -> u32 {
+        self.scaled[i].iter().scan(0u32, |first, &(count, delta)| { let at = *first; *first = first.saturating_add(count); Some((at, count, delta)) })
+            .find(|&(at, count, _)| (at..at.saturating_add(count)).contains(&s)).map_or(0, |e| e.2)
+    }
+
+    /// File `i`'s last sample, which `keeps_last` keeps as its last (after `truncate`), lasts `duration` ticks of the
+    /// merged timescale, less than its own: in the merged track's sample durations (`scaled`), which the edits, the gap
+    /// after the file and the next file's media follow. Returns by how much less its media then lasts, in those ticks,
+    /// exactly (its own timescale may not hold that), by which the merged track's media duration (`mdhd`) has less of the
+    /// file's own (`Plan::shortened`)
+    fn shorten(&mut self, i: usize, duration: u32) -> u64 {
+        let runs = &mut self.scaled[i];
+        let Some(k) = runs.iter().rposition(|e| e.0 > 0) else {
+            debug_assert!(false, "{}: file {} has no sample to shorten", self.name, i + 1);
+            return 0;
+        };
+        let (count, delta) = runs[k];
+        runs.splice(k..=k, [(count - 1, delta), (1, duration)].into_iter().filter(|e| e.0 > 0));
+        delta.saturating_sub(duration) as u64
     }
 
     /// Keeps only file `i`'s first `kept` samples (`head`)
@@ -1221,8 +1628,12 @@ fn merged_edits(plan: &Plan, offsets: &[u64], media_end: u64, timescale: u32, na
 
 /// How a gap in a sound track whose every sample lasts one tick in the merged track is filled (`Pcm`): with silence when
 /// it is PCM whose silence the merge can write and whose tables it can extend by the silence's samples. That takes:
-/// - sample entries that describe PCM frames the same way (`pcm_entry`), of one size in every file: the frame's, or
-///   QuickTime's legacy 1, where FFmpeg takes the frame size from the sample entry (`mov_parse_stsd_audio`);
+/// - sample entries that describe PCM frames the same way (`pcm_entry`), and one sample size (`stsz`) for every sample of
+///   every file. FFmpeg reads such a track in frames of the size the sample entry gives (`mov_parse_stsd_audio`), which
+///   `mov_read_stsz` doesn't overwrite, whatever the sample size is: the frame's, QuickTime's legacy 1, or one channel's
+///   sample, as Atomos writes `in24`. Where the entry doesn't give it the frame's size (`pcm_entry`: `ipcm` and `fpcm`,
+///   whose coding it knows from their `pcmC` after the entry, an `lpcm` of a coding it has no codec for, frames of 2^31
+///   bytes or more), it reads frames of the sample size, which must be the frame's then;
 /// - no composition offsets, and no per-sample box the merge doesn't rebuild (`PartTrack::unmerged`). Sync samples,
 ///   dependencies (`sdtp`) and sample groups are extended: the silence's samples are sync samples, of unknown
 ///   dependencies, in the groups that samples no mapping covers are (`sample_groups`)
@@ -1253,29 +1664,46 @@ fn pcm(tracks: &[&PartTrack], scaled: &[Vec<(u32, u32)>]) -> Pcm {
         let size = e.get(..4).map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap()) as usize);
         match pcm_entry(first.stsd.first().copied().unwrap_or(0), entry.format, e.get(..size).unwrap_or(e)) {
             Err(why) => return Pcm::Unfilled(why),
-            Ok(c) if common.is_some_and(|common| common != c) => return Pcm::Unfilled("its sample entries describe other PCM frames".into()),
+            Ok(c) if common.is_some_and(|common: PcmFrames| (common.frame, common.byte) != (c.frame, c.byte)) => return Pcm::Unfilled("its sample entries describe other PCM frames".into()),
+            Ok(c) if common.is_some_and(|common: PcmFrames| common.by_entry != c.by_entry) => {
+                return Pcm::Unfilled("FFmpeg reads the frames of some of its sample entries by the entry, and of others in the samples' size".into());
+            }
             Ok(c) => common = Some(c)
         }
     }
     match common {
         None => Pcm::Unfilled("it has no sample entry".into()),
-        Some((frame, _)) if first.stsz_sample_size != frame && first.stsz_sample_size != 1 => {
-            Pcm::Unfilled(format!("its samples of {} bytes aren't its PCM frames of {frame} bytes", first.stsz_sample_size))
+        Some(PcmFrames { frame, by_entry: false, .. }) if first.stsz_sample_size != frame => {
+            Pcm::Unfilled(format!("its samples of {} bytes aren't its PCM frames of {frame} bytes, and FFmpeg reads the frames of its coding in the samples' size", first.stsz_sample_size))
         }
-        Some((frame, byte)) => Pcm::Silence { frame, byte }
+        Some(PcmFrames { frame, byte, .. }) => Pcm::Silence { frame, byte }
     }
+}
+
+/// The PCM frames a sound sample entry describes (`pcm_entry`)
+#[derive(Clone, Copy, PartialEq)]
+struct PcmFrames {
+    frame: u32,     // Its bytes
+    byte: u8,       // The byte silence is
+    by_entry: bool, // Whether FFmpeg reads the frames by the entry, rather than in the size `stsz` gives
 }
 
 /// The bytes of a PCM frame, and the byte silence is, of the sound sample entry `e` (with its box header) of type `format`,
 /// in an `stsd` of version `stsd_version`. Read as FFmpeg reads them (`mov_parse_stsd_audio`, `mov_read_pcmc`):
-//  a frame is the channels times the sample size, which `in24`, `in32`, `fl32`, `fl64` and `raw ` fix, and the
+/// a frame is the channels times the sample size, which `in24`, `in32`, `fl32`, `fl64` and `raw ` fix, and the
 /// `pcmC` box of ISO/IEC 23003-5's `ipcm` and `fpcm` gives. QuickTime's version 1 sound description (samplesPerPacket,
 /// bytesPerFrame) or version 2 one (constLPCMFramesPerAudioPacket, constBytesPerAudioPacket) must declare packets of one
 /// such frame; an ISO `stsd` of version 1 holds ISO's AudioSampleEntryV1 instead, whose channels a ChannelLayout box may
-/// give, which isn't read. Silence is 0 for two's complement and floating point samples, and 0x80 for 8-bit offset binary
-/// (`raw `, an 8-bit `NONE`, and an `lpcm` whose version 2 flags say neither float nor signed). `Err` says why the entry
-/// isn't PCM whose silence the merge writes: another coding, or a malformed description
-fn pcm_entry(stsd_version: u8, format: u32, e: &[u8]) -> std::result::Result<(u32, u8), String> {
+/// give, which isn't read. FFmpeg must read samples of that size: those of the codec the format names
+/// (`ff_codec_movaudio_tags`), which the entry's sample size changes for `twos`, `sowt`, `NONE`, `raw ` and an `lpcm` of
+/// version 0 or 1 (`mov_parse_stsd_audio`), and which the flags of an `lpcm` of version 2 give (`ff_mov_get_lpcm_codec_id`).
+/// Silence is 0 for two's complement and floating point samples, and 0x80 for 8-bit offset binary (`raw `, an 8-bit
+/// `NONE`, and an `lpcm` whose version 2 flags say neither float nor signed). Also says whether FFmpeg reads the frames
+/// by the entry: not those of `ipcm` and `fpcm`, whose coding it knows only from their `pcmC`, after the entry
+/// (`mov_read_pcmc`), nor of an `lpcm` it has no codec for, nor frames of 2^31 bytes or more, which it reads in the size
+/// `stsz` gives. `Err` says why the entry isn't PCM whose silence the merge writes: another coding, or a malformed
+/// description
+fn pcm_entry(stsd_version: u8, format: u32, e: &[u8]) -> std::result::Result<PcmFrames, String> {
     let f = format.to_be_bytes();
     if !matches!(&f, b"twos" | b"sowt" | b"lpcm" | b"NONE" | b"raw " | b"in24" | b"in32" | b"fl32" | b"fl64" | b"ipcm" | b"fpcm") {
         return Err(format!("its samples are '{}', not PCM the merge writes the silence of", typ_to_str(format)));
@@ -1303,6 +1731,7 @@ fn pcm_entry(stsd_version: u8, format: u32, e: &[u8]) -> std::result::Result<(u3
         }
         v => return Err(format!("its sample entry has version {v} in an stsd of version {stsd_version}, whose channels aren't read"))
     };
+    let entry_bits = bits; // The entry's sample size
     let bits = match &f {
         b"in24" => 24,
         b"in32" | b"fl32" => 32,
@@ -1340,6 +1769,23 @@ fn pcm_entry(stsd_version: u8, format: u32, e: &[u8]) -> std::result::Result<(u3
         Some((_, bytes)) if bytes != frame => return Err(malformed(format!("it declares frames of {bytes} bytes, and {channels} channels × {bits} bits make {frame}"))),
         _ => {}
     }
+    // The sample size FFmpeg reads, when it reads its frames by the entry
+    let ffmpeg_bits = match (&f, flags) {
+        (b"twos" | b"sowt", _) | (b"lpcm", None) => Some(if matches!(entry_bits, 8 | 24 | 32) { entry_bits } else { 16 }),
+        (b"lpcm", Some(flags)) => match (flags & 1 != 0, flags & 4 != 0, entry_bits.div_ceil(8)) {
+            (true, _, _) => matches!(entry_bits, 32 | 64).then_some(entry_bits),
+            (false, true, bytes @ (1..=4 | 8)) | (false, false, bytes @ 1..=4) if entry_bits <= 64 => Some(bytes * 8),
+            _ => None
+        },
+        (b"NONE" | b"raw ", _) => Some(if entry_bits == 16 { 16 } else { 8 }),
+        (b"ipcm" | b"fpcm", _) => None,
+        _ => Some(bits)
+    };
+    let by_entry = match ffmpeg_bits {
+        Some(read) if read != bits => return Err(format!("FFmpeg reads its '{}' samples of {bits} bits as {read}-bit ones", typ_to_str(format))),
+        Some(_) => frame <= i32::MAX as u32,
+        None => false
+    };
     let silence = match (&f, flags) {
         (b"raw ", _) => 0x80,
         (b"NONE", _) if bits == 8 => 0x80,
@@ -1348,7 +1794,7 @@ fn pcm_entry(stsd_version: u8, format: u32, e: &[u8]) -> std::result::Result<(u3
         }
         _ => 0
     };
-    Ok((frame, silence))
+    Ok(PcmFrames { frame, byte: silence, by_entry })
 }
 
 /// The sample-to-group mappings of the merged track, one for each `sbgp` and each `csgm` of the first file's (the merged
